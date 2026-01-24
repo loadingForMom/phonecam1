@@ -6,11 +6,26 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import android.content.ComponentName
+import android.content.Intent
+import android.content.ServiceConnection
+import android.os.IBinder
 
 class LogsActivity : AppCompatActivity() {
 
     private lateinit var txtStats: TextView
     private lateinit var txtLogs: TextView
+    private var bound = false
+
+    private val serviceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+            bound = true
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            bound = false
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -37,6 +52,20 @@ class LogsActivity : AppCompatActivity() {
             StreamState.logs.collectLatest { line ->
                 txtLogs.append("\n$line")
             }
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        val intent = Intent(this, H264StreamService::class.java)
+        bindService(intent, serviceConnection, BIND_AUTO_CREATE)
+    }
+
+    override fun onStop() {
+        super.onStop()
+        if (bound) {
+            unbindService(serviceConnection)
+            bound = false
         }
     }
 }
