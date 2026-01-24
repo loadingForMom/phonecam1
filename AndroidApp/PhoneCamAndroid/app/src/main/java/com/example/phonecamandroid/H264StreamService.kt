@@ -29,12 +29,12 @@ class H264StreamService : Service() {
     override fun onCreate() {
         super.onCreate()
         StreamState.log("Service created")
-        startForeground(NOTIF_ID, buildNotification("Starting…"))
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> {
+            startForeground(NOTIF_ID, buildNotification("Starting…"))
                 val host = intent.getStringExtra(EXTRA_HOST) ?: "192.168.137.1"
                 val port = intent.getIntExtra(EXTRA_PORT, 39010)
                 val width = intent.getIntExtra(EXTRA_WIDTH, 1280)
