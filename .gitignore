@@ -1,0 +1,78 @@
+﻿############################
+# .NET / Visual Studio
+############################
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Dd]ebug*/
+[Rr]elease*/
+x64/
+x86/
+[Aa]nyCPU/
+
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.cache
+*.pdb
+*.mdb
+*.opendb
+*.dbmdl
+*.jfm
+*.jfr
+*.tlog
+*.ilk
+
+# VS folders
+.vs/
+
+############################
+# Rider / JetBrains
+############################
+.idea/
+*.sln.iml
+
+############################
+# VS Code
+############################
+.vscode/
+
+############################
+# NuGet / dotnet
+############################
+*.nupkg
+*.snupkg
+project.lock.json
+packages/
+.nuget/
+# (обычно не игнорят packages.lock.json — лучше оставить в репо)
+
+############################
+# Android / Gradle
+############################
+.gradle/
+**/build/
+local.properties
+
+# Android Studio / IntelliJ
+*.iml
+.idea/
+*.ipr
+*.iws
+/out/
+
+# NDK / CMake
+.cxx/
+.externalNativeBuild/
+
+# Android artifacts
+*.apk
+*.aab
+
+############################
+# OS junk
+############################
+.DS_Store
+Thumbs.db
+Desktop.ini

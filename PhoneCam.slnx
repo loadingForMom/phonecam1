@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="PhoneCam.Core/PhoneCam.Core.csproj" />
+  <Project Path="PhoneCam.Tray/PhoneCam.Tray.csproj" />
+</Solution>

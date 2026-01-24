@@ -1,0 +1,15 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <!-- Защита от случайного попадания WinForms/FFmpeg файлов в Core -->
+  <ItemGroup>
+    <Compile Remove="**\VideoForm.cs" />
+    <Compile Remove="**\H264FfmpegDecoder.cs" />
+  </ItemGroup>
+
+</Project>

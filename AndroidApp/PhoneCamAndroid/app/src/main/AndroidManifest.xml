@@ -1,0 +1,38 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Foreground Service (нужно для стрима в фоне / при погашенном экране) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Android 14+ (targetSdk 34+) требует отдельные perms под типы FGS -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+
+    <!-- Android 13+ уведомления (чтобы FGS нотификация показывалась) -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Android 13+ Wi-Fi direct/nearby; для хотспота обычно не нужен, но пусть будет -->
+    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"
+                     android:usesPermissionFlags="neverForLocation" />
+
+    <application
+            android:allowBackup="true"
+            android:label="PhoneCam"
+            android:supportsRtl="true"
+            android:theme="@style/Theme.PhoneCamAndroid">
+        <activity android:name=".MainActivity"
+                  android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity>
+
+        <service
+                android:name=".H264StreamService"
+                android:exported="false"
+                android:foregroundServiceType="camera|microphone" />
+    </application>
+</manifest>
