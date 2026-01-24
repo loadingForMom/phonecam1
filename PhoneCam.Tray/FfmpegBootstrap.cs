@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -28,6 +29,8 @@ internal static class FfmpegBootstrap
         "swscale",
         "swresample"
     ];
+
+    private static bool _resolverInstalled;
 
     public static void LoadOrThrow()
     {
@@ -62,6 +65,8 @@ internal static class FfmpegBootstrap
             }
         }
 
+        InstallResolver(nativeDir, libraryMap);
+
         // Для FFmpeg.AutoGen (динамические биндинги)
         ffmpeg.RootPath = nativeDir;
 
@@ -86,6 +91,8 @@ internal static class FfmpegBootstrap
             {
                 if (SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS))
                     AddDllDirectory(nativeDir);
+
+                InstallResolver(nativeDir, libraryMap);
 
                 ffmpeg.RootPath = nativeDir;
                 version = ffmpeg.avcodec_version();
@@ -150,7 +157,9 @@ internal static class FfmpegBootstrap
         sb.AppendLine("FFmpeg diagnostics:");
         sb.AppendLine($"  BaseDir: {AppContext.BaseDirectory}");
         sb.AppendLine($"  ProcessArch: {RuntimeInformation.ProcessArchitecture}");
+        sb.AppendLine($"  Is64BitProcess: {Environment.Is64BitProcess}");
         sb.AppendLine($"  OS: {RuntimeInformation.OSDescription}");
+        sb.AppendLine($"  PHONCAM_FFMPEG_PATH: {Environment.GetEnvironmentVariable("PHONCAM_FFMPEG_PATH") ?? "<unset>"}");
         sb.AppendLine($"  NativeDir: {(string.IsNullOrWhiteSpace(nativeDir) ? "<not found>" : nativeDir)}");
         sb.AppendLine("  Libraries:");
         foreach (var kvp in libraryMap)
@@ -159,6 +168,56 @@ internal static class FfmpegBootstrap
         }
 
         sb.AppendLine($"  avcodec_version: {(avcodecVersion.HasValue ? avcodecVersion.Value.ToString() : "<not loaded>")}");
+        AppendLoadedModules(sb);
         return sb.ToString();
+    }
+
+    private static void InstallResolver(string nativeDir, Dictionary<string, string?> libraryMap)
+    {
+        if (_resolverInstalled)
+            return;
+
+        NativeLibrary.SetDllImportResolver(typeof(ffmpeg).Assembly, (libraryName, assembly, searchPath) =>
+        {
+            if (string.IsNullOrWhiteSpace(libraryName))
+                return IntPtr.Zero;
+
+            var match = libraryMap
+                .FirstOrDefault(kvp => libraryName.StartsWith(kvp.Key, StringComparison.OrdinalIgnoreCase));
+
+            if (!string.IsNullOrWhiteSpace(match.Value) && File.Exists(match.Value))
+            {
+                return NativeLibrary.Load(match.Value);
+            }
+
+            var fallback = Path.Combine(nativeDir, libraryName.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)
+                ? libraryName
+                : libraryName + ".dll");
+
+            return File.Exists(fallback) ? NativeLibrary.Load(fallback) : IntPtr.Zero;
+        });
+
+        _resolverInstalled = true;
+    }
+
+    private static void AppendLoadedModules(StringBuilder sb)
+    {
+        try
+        {
+            sb.AppendLine("  Loaded modules (FFmpeg-related):");
+            using var process = Process.GetCurrentProcess();
+            foreach (ProcessModule module in process.Modules)
+            {
+                var name = module.ModuleName ?? string.Empty;
+                if (RequiredLibraryPrefixes.Any(prefix => name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)))
+                {
+                    sb.AppendLine($"    {name} → {module.FileName}");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            sb.AppendLine($"  Loaded modules: <unavailable> {ex.Message}");
+        }
     }
 }

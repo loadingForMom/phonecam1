@@ -98,8 +98,21 @@ class MainActivity : AppCompatActivity() {
 
         lifecycleScope.launch {
             StreamState.stats.collectLatest { stats ->
-                txtStatus.text = "State=${stats.connectionState} FPS=${"%.1f".format(stats.fps)} " +
+                val idleStates = setOf("Idle", "Stopped", "Failed", "Control failed", "Stream init failed")
+                val baseStatus = "State=${stats.connectionState} FPS=${"%.1f".format(stats.fps)} " +
                     "Bitrate=${"%.0f".format(stats.bitrateKbps)} kbps"
+                txtStatus.text = if (stats.connectionState in idleStates) {
+                    "$baseStatus (Preview starts when streaming)"
+                } else {
+                    baseStatus
+                }
+                if (stats.connectionState in idleStates) {
+                    btnStart.isEnabled = true
+                    btnStop.isEnabled = false
+                } else if (stats.connectionState == "Streaming") {
+                    btnStart.isEnabled = false
+                    btnStop.isEnabled = true
+                }
             }
         }
     }

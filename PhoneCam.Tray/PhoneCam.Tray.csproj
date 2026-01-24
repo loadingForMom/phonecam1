@@ -5,7 +5,7 @@
 
         <PackageReference Include="FFmpeg.AutoGen" Version="8.0.0" />
         <PackageReference Include="FFmpeg.Native" Version="1.0.0-r31" />
-        <PackageReference Include="Microsoft.Windows.SDK.Contracts" Version="10.0.26100.1" />
+        <PackageReference Include="Microsoft.Windows.SDK.NET" Version="10.0.26100.1" />
         <PackageReference Include="System.Drawing.Common" Version="8.0.0" />
     </ItemGroup>
 
@@ -20,6 +20,7 @@
 
         <!-- чтобы атрибуты SupportedOSPlatformVersion не конфликтовали -->
         <SupportedOSPlatformVersion>10.0.19041.0</SupportedOSPlatformVersion>
+        <WindowsSdkPackageVersion>10.0.26100.1</WindowsSdkPackageVersion>
 
         <UseWindowsForms>true</UseWindowsForms>
         <Nullable>enable</Nullable>

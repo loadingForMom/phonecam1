@@ -61,8 +61,8 @@ class UdpH264Streamer(
     private var localIp: String = "-"
     private var remoteLabel: String = "-"
 
-    fun start(host: String, port: Int, width: Int, height: Int, fps: Int, bitrate: Int) {
-        try {
+    fun start(host: String, port: Int, width: Int, height: Int, fps: Int, bitrate: Int): Boolean {
+        return try {
             remoteAddress = InetAddress.getByName(host)
             remotePort = port
             socket = DatagramSocket()
@@ -81,10 +81,11 @@ class UdpH264Streamer(
                     remote = remoteLabel
                 )
             )
+            true
         } catch (ex: Throwable) {
             log("Streamer start error: ${ex.message}")
             stop()
-            throw ex
+            false
         }
     }
 
@@ -315,7 +316,6 @@ class UdpH264Streamer(
         } catch (ex: Throwable) {
             log("Camera open error: ${ex.message}")
             stop()
-            throw ex
         }
     }
 

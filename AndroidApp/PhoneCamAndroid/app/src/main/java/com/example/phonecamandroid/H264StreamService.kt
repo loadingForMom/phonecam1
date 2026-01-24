@@ -8,6 +8,7 @@ import android.content.Intent
 import android.os.Build
 import android.os.Binder
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import kotlin.concurrent.thread
 
@@ -51,12 +52,12 @@ class H264StreamService : Service() {
                     )
                 )
 
-                thread(name = "PhoneCam-Control") {
+                val worker = thread(start = false, name = "PhoneCam-Control") {
                     try {
                         val negotiated = try {
                             TcpControlClient.negotiate(host, 39000, width, height, fps, bitrate)
                         } catch (ex: Throwable) {
-                            StreamState.log("Control: ${ex.message}")
+                            logException("Control failed to connect", ex)
                             null
                         }
 
@@ -68,6 +69,8 @@ class H264StreamService : Service() {
                                 )
                             )
                             stopStreamerIfAny()
+                            stopForeground(STOP_FOREGROUND_REMOVE)
+                            stopSelf()
                             return@thread
                         }
 
@@ -76,20 +79,26 @@ class H264StreamService : Service() {
                             st.setPreviewSurface(previewSurface)
                             st.onLog = { StreamState.log(it) }
                             st.onStats = { stats -> StreamState.updateStats(stats) }
-                            st.start(
-                                host = host,
-                                port = udpPort,
-                                width = width,
-                                height = height,
-                                fps = fps,
-                                bitrate = bitrate
+                        }
+
+                        val started = streamer?.start(host, udpPort, width, height, fps, bitrate) == true
+                        if (!started) {
+                            StreamState.updateStats(
+                                StreamStats(
+                                    connectionState = "Stream init failed",
+                                    remote = "$host:$udpPort"
+                                )
                             )
+                            stopStreamerIfAny()
+                            stopForeground(STOP_FOREGROUND_REMOVE)
+                            stopSelf()
+                            return@thread
                         }
 
                         val nm = getSystemService(NotificationManager::class.java)
                         nm.notify(NOTIF_ID, buildNotification("Streaming → $host:$udpPort"))
                     } catch (ex: Throwable) {
-                        StreamState.log("Streaming start failed: ${ex.message}")
+                        logException("Streaming start failed", ex)
                         StreamState.updateStats(
                             StreamStats(
                                 connectionState = "Failed",
@@ -97,8 +106,23 @@ class H264StreamService : Service() {
                             )
                         )
                         stopStreamerIfAny()
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopSelf()
                     }
                 }
+                worker.uncaughtExceptionHandler = Thread.UncaughtExceptionHandler { _, ex ->
+                    logException("Control thread crashed", ex)
+                    StreamState.updateStats(
+                        StreamStats(
+                            connectionState = "Failed",
+                            remote = "$host:$port"
+                        )
+                    )
+                    stopStreamerIfAny()
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }
+                worker.start()
             }
 
             ACTION_STOP -> {
@@ -121,6 +145,11 @@ class H264StreamService : Service() {
     private fun stopStreamerIfAny() {
         streamer?.stop()
         streamer = null
+    }
+
+    private fun logException(prefix: String, ex: Throwable) {
+        val stack = Log.getStackTraceString(ex)
+        StreamState.log("$prefix: $stack")
     }
 
     fun setPreviewSurface(surface: android.view.Surface?) {
