@@ -34,7 +34,7 @@ class H264StreamService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> {
-            startForeground(NOTIF_ID, buildNotification("Starting…"))
+                startForeground(NOTIF_ID, buildNotification("Starting…"))
                 val host = intent.getStringExtra(EXTRA_HOST) ?: "192.168.137.1"
                 val port = intent.getIntExtra(EXTRA_PORT, 39010)
                 val width = intent.getIntExtra(EXTRA_WIDTH, 1280)
@@ -52,30 +52,52 @@ class H264StreamService : Service() {
                 )
 
                 thread(name = "PhoneCam-Control") {
-                    val udpPort = try {
-                        val negotiated = TcpControlClient.negotiate(host, 39000, width, height, fps, bitrate)
-                        negotiated?.udpPort ?: port
+                    try {
+                        val negotiated = try {
+                            TcpControlClient.negotiate(host, 39000, width, height, fps, bitrate)
+                        } catch (ex: Throwable) {
+                            StreamState.log("Control: ${ex.message}")
+                            null
+                        }
+
+                        if (negotiated == null) {
+                            StreamState.updateStats(
+                                StreamStats(
+                                    connectionState = "Control failed",
+                                    remote = "$host:$port"
+                                )
+                            )
+                            stopStreamerIfAny()
+                            return@thread
+                        }
+
+                        val udpPort = negotiated.udpPort
+                        streamer = UdpH264Streamer(this).also { st ->
+                            st.setPreviewSurface(previewSurface)
+                            st.onLog = { StreamState.log(it) }
+                            st.onStats = { stats -> StreamState.updateStats(stats) }
+                            st.start(
+                                host = host,
+                                port = udpPort,
+                                width = width,
+                                height = height,
+                                fps = fps,
+                                bitrate = bitrate
+                            )
+                        }
+
+                        val nm = getSystemService(NotificationManager::class.java)
+                        nm.notify(NOTIF_ID, buildNotification("Streaming → $host:$udpPort"))
                     } catch (ex: Throwable) {
-                        StreamState.log("Control: ${ex.message}")
-                        port
-                    }
-
-                    streamer = UdpH264Streamer(this).also { st ->
-                        st.setPreviewSurface(previewSurface)
-                        st.onLog = { StreamState.log(it) }
-                        st.onStats = { stats -> StreamState.updateStats(stats) }
-                        st.start(
-                            host = host,
-                            port = udpPort,
-                            width = width,
-                            height = height,
-                            fps = fps,
-                            bitrate = bitrate
+                        StreamState.log("Streaming start failed: ${ex.message}")
+                        StreamState.updateStats(
+                            StreamStats(
+                                connectionState = "Failed",
+                                remote = "$host:$port"
+                            )
                         )
+                        stopStreamerIfAny()
                     }
-
-                    val nm = getSystemService(NotificationManager::class.java)
-                    nm.notify(NOTIF_ID, buildNotification("Streaming → $host:$udpPort"))
                 }
             }
 

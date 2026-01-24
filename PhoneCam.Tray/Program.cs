@@ -14,7 +14,8 @@ internal static class Program
         }
         catch (Exception ex)
         {
-            MessageBox.Show(ex.ToString(), "Failed to load FFmpeg");
+            var report = FfmpegBootstrap.SelfCheck();
+            MessageBox.Show(ex + Environment.NewLine + Environment.NewLine + report, "Failed to load FFmpeg");
             return;
         
         }

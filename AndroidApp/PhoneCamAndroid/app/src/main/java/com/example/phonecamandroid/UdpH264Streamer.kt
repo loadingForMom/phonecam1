@@ -62,24 +62,30 @@ class UdpH264Streamer(
     private var remoteLabel: String = "-"
 
     fun start(host: String, port: Int, width: Int, height: Int, fps: Int, bitrate: Int) {
-        remoteAddress = InetAddress.getByName(host)
-        remotePort = port
-        socket = DatagramSocket()
-        localIp = resolveLocalIp() ?: "-"
-        remoteLabel = "$host:$port"
+        try {
+            remoteAddress = InetAddress.getByName(host)
+            remotePort = port
+            socket = DatagramSocket()
+            localIp = resolveLocalIp() ?: "-"
+            remoteLabel = "$host:$port"
 
-        cameraThread = HandlerThread("PhoneCam-CameraThread").also { it.start() }
-        cameraHandler = Handler(cameraThread!!.looper)
+            cameraThread = HandlerThread("PhoneCam-CameraThread").also { it.start() }
+            cameraHandler = Handler(cameraThread!!.looper)
 
-        setupEncoder(width, height, fps, bitrate)
-        openCamera()
-        onStats?.invoke(
-            StreamStats(
-                connectionState = "Streaming",
-                localIp = localIp,
-                remote = remoteLabel
+            setupEncoder(width, height, fps, bitrate)
+            openCamera()
+            onStats?.invoke(
+                StreamStats(
+                    connectionState = "Streaming",
+                    localIp = localIp,
+                    remote = remoteLabel
+                )
             )
-        )
+        } catch (ex: Throwable) {
+            log("Streamer start error: ${ex.message}")
+            stop()
+            throw ex
+        }
     }
 
     fun stop() {
@@ -284,27 +290,33 @@ class UdpH264Streamer(
 
     @android.annotation.SuppressLint("MissingPermission")
     private fun openCamera() {
-        val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-        val cameraId = chooseBackCamera(manager) ?: manager.cameraIdList.firstOrNull() ?: run {
-            stop(); return
+        try {
+            val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val cameraId = chooseBackCamera(manager) ?: manager.cameraIdList.firstOrNull() ?: run {
+                stop(); return
+            }
+
+            manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
+                override fun onOpened(camera: CameraDevice) {
+                    cameraDevice = camera
+                    createSession()
+                }
+
+                override fun onDisconnected(camera: CameraDevice) {
+                    try { camera.close() } catch (_: Throwable) {}
+                    stop()
+                }
+
+                override fun onError(camera: CameraDevice, error: Int) {
+                    try { camera.close() } catch (_: Throwable) {}
+                    stop()
+                }
+            }, cameraHandler)
+        } catch (ex: Throwable) {
+            log("Camera open error: ${ex.message}")
+            stop()
+            throw ex
         }
-
-        manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
-            override fun onOpened(camera: CameraDevice) {
-                cameraDevice = camera
-                createSession()
-            }
-
-            override fun onDisconnected(camera: CameraDevice) {
-                try { camera.close() } catch (_: Throwable) {}
-                stop()
-            }
-
-            override fun onError(camera: CameraDevice, error: Int) {
-                try { camera.close() } catch (_: Throwable) {}
-                stop()
-            }
-        }, cameraHandler)
     }
 
     private fun chooseBackCamera(manager: CameraManager): String? {
