@@ -70,7 +70,8 @@ class H264StreamService : Service() {
                             )
                             stopStreamerIfAny()
                             stopForeground(STOP_FOREGROUND_REMOVE)
-                            stopSelf()
+                            val nm = getSystemService(NotificationManager::class.java)
+                            nm.notify(NOTIF_ID, buildNotification("Control failed"))
                             return@thread
                         }
 
@@ -91,7 +92,8 @@ class H264StreamService : Service() {
                             )
                             stopStreamerIfAny()
                             stopForeground(STOP_FOREGROUND_REMOVE)
-                            stopSelf()
+                            val nm = getSystemService(NotificationManager::class.java)
+                            nm.notify(NOTIF_ID, buildNotification("Stream init failed"))
                             return@thread
                         }
 
@@ -107,7 +109,8 @@ class H264StreamService : Service() {
                         )
                         stopStreamerIfAny()
                         stopForeground(STOP_FOREGROUND_REMOVE)
-                        stopSelf()
+                        val nm = getSystemService(NotificationManager::class.java)
+                        nm.notify(NOTIF_ID, buildNotification("Streaming failed"))
                     }
                 }
                 worker.uncaughtExceptionHandler = Thread.UncaughtExceptionHandler { _, ex ->
@@ -120,7 +123,8 @@ class H264StreamService : Service() {
                     )
                     stopStreamerIfAny()
                     stopForeground(STOP_FOREGROUND_REMOVE)
-                    stopSelf()
+                    val nm = getSystemService(NotificationManager::class.java)
+                    nm.notify(NOTIF_ID, buildNotification("Streaming failed"))
                 }
                 worker.start()
             }

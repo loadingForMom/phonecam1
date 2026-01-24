@@ -137,47 +137,57 @@ class UdpH264Streamer(
                 override fun onInputBufferAvailable(codec: MediaCodec, index: Int) {}
 
                 override fun onOutputBufferAvailable(codec: MediaCodec, index: Int, info: MediaCodec.BufferInfo) {
-                    val out = codec.getOutputBuffer(index) ?: run {
+                    try {
+                        val out = codec.getOutputBuffer(index) ?: run {
+                            codec.releaseOutputBuffer(index, false)
+                            return
+                        }
+
+                        if (info.size <= 0) {
+                            codec.releaseOutputBuffer(index, false)
+                            return
+                        }
+
+                        val data = ByteArray(info.size)
+                        out.position(info.offset)
+                        out.limit(info.offset + info.size)
+                        out.get(data)
                         codec.releaseOutputBuffer(index, false)
-                        return
+
+                        if ((info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
+                            codecConfigAnnexB = normalizeToAnnexB(data)
+                            sentConfigOnce = false
+                            return
+                        }
+
+                        val isKeyFrame = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+                        val cfg = codecConfigAnnexB
+                        if (cfg != null && (isKeyFrame || !sentConfigOnce)) {
+                            sendFrame(cfg, isConfig = true, isKeyFrame = true)
+                            sentConfigOnce = true
+                        }
+
+                        sendFrame(normalizeToAnnexB(data), isConfig = false, isKeyFrame = isKeyFrame)
+                    } catch (ex: Throwable) {
+                        log("Encoder output error: ${ex.message}")
+                        stop()
                     }
-
-                    if (info.size <= 0) {
-                        codec.releaseOutputBuffer(index, false)
-                        return
-                    }
-
-                    val data = ByteArray(info.size)
-                    out.position(info.offset)
-                    out.limit(info.offset + info.size)
-                    out.get(data)
-                    codec.releaseOutputBuffer(index, false)
-
-                    if ((info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
-                        codecConfigAnnexB = normalizeToAnnexB(data)
-                        sentConfigOnce = false
-                        return
-                    }
-
-                    val isKeyFrame = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
-                    val cfg = codecConfigAnnexB
-                    if (cfg != null && (isKeyFrame || !sentConfigOnce)) {
-                        sendFrame(cfg, isConfig = true, isKeyFrame = true)
-                        sentConfigOnce = true
-                    }
-
-                    sendFrame(normalizeToAnnexB(data), isConfig = false, isKeyFrame = isKeyFrame)
                 }
 
                 override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {
-                    val csd0 = format.getByteBuffer("csd-0")?.let { bbToByteArray(it) }
-                    val csd1 = format.getByteBuffer("csd-1")?.let { bbToByteArray(it) }
-                    if (csd0 != null && csd1 != null) {
-                        val merged = ByteArray(csd0.size + csd1.size)
-                        System.arraycopy(csd0, 0, merged, 0, csd0.size)
-                        System.arraycopy(csd1, 0, merged, csd0.size, csd1.size)
-                        codecConfigAnnexB = normalizeToAnnexB(merged)
-                        sentConfigOnce = false
+                    try {
+                        val csd0 = format.getByteBuffer("csd-0")?.let { bbToByteArray(it) }
+                        val csd1 = format.getByteBuffer("csd-1")?.let { bbToByteArray(it) }
+                        if (csd0 != null && csd1 != null) {
+                            val merged = ByteArray(csd0.size + csd1.size)
+                            System.arraycopy(csd0, 0, merged, 0, csd0.size)
+                            System.arraycopy(csd1, 0, merged, csd0.size, csd1.size)
+                            codecConfigAnnexB = normalizeToAnnexB(merged)
+                            sentConfigOnce = false
+                        }
+                    } catch (ex: Throwable) {
+                        log("Encoder format error: ${ex.message}")
+                        stop()
                     }
                 }
 
