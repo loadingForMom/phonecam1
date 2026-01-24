@@ -17,12 +17,16 @@ public sealed class TrayAppContext : ApplicationContext
     private readonly ToolStripMenuItem _startItem;
     private readonly ToolStripMenuItem _stopItem;
     private readonly ToolStripMenuItem _showVideoItem;
+    private readonly ToolStripMenuItem _debugItem;
+    private readonly ToolStripMenuItem _bleItem;
 
     private bool _running;
 
     private VideoForm? _videoForm;
+    private LogForm? _logForm;
     private CancellationTokenSource? _decodeCts;
     private Task? _decodeTask;
+    private BleHandshakeService? _ble;
 
     private static readonly string LogPath =
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -36,6 +40,8 @@ public sealed class TrayAppContext : ApplicationContext
         _startItem = new ToolStripMenuItem("Start", null, (_, _) => Start());
         _stopItem = new ToolStripMenuItem("Stop", null, (_, _) => Stop()) { Enabled = false };
         _showVideoItem = new ToolStripMenuItem("Show Video", null, (_, _) => ShowVideo()) { Enabled = false };
+        _debugItem = new ToolStripMenuItem("Debug Console", null, (_, _) => ShowDebugConsole());
+        _bleItem = new ToolStripMenuItem("Start BLE Advertise", null, async (_, _) => await ToggleBleAsync());
 
         var exitItem = new ToolStripMenuItem("Exit", null, (_, _) => Exit());
 
@@ -43,6 +49,8 @@ public sealed class TrayAppContext : ApplicationContext
         menu.Items.Add(_startItem);
         menu.Items.Add(_stopItem);
         menu.Items.Add(_showVideoItem);
+        menu.Items.Add(_debugItem);
+        menu.Items.Add(_bleItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(exitItem);
 
@@ -191,6 +199,7 @@ public sealed class TrayAppContext : ApplicationContext
         Log("Exit clicked");
 
         StopDecodeLoop();
+        _ble?.Stop();
 
         if (_server is not null)
         {
@@ -203,12 +212,47 @@ public sealed class TrayAppContext : ApplicationContext
         Application.Exit();
     }
 
-    private static void Log(string msg)
+    private void Log(string msg)
     {
         var line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} {msg}";
         File.AppendAllText(LogPath, line + Environment.NewLine);
         Debug.WriteLine(line);
+        _logForm?.AppendLine(line);
     }
+
+    private void ShowDebugConsole()
+    {
+        if (_logForm is null || _logForm.IsDisposed)
+        {
+            _logForm = new LogForm();
+            _logForm.FormClosed += (_, _) => _logForm = null;
+            _logForm.Show();
+        }
+        else
+        {
+            _logForm.WindowState = FormWindowState.Normal;
+            _logForm.BringToFront();
+            _logForm.Activate();
+        }
+    }
+
+    private async Task ToggleBleAsync()
+    {
+        _ble ??= new BleHandshakeService();
+        _ble.OnLog += Log;
+
+        if (_ble.IsRunning)
+        {
+            _ble.Stop();
+            _bleItem.Text = "Start BLE Advertise";
+            return;
+        }
+
+        var payload = "pcam;ver=1;tcp=39000;udp=39010;ssid=?;psk=?";
+        await _ble.StartAsync(payload);
+        _bleItem.Text = "Stop BLE Advertise";
+    }
+
 
     protected override void Dispose(bool disposing)
     {

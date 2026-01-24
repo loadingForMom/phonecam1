@@ -110,8 +110,8 @@ public sealed class PhoneCamServer : IAsyncDisposable
             var buf = new byte[4096];
             var sb = new StringBuilder();
 
-            // привет + сообщаем UDP порт
-            await SendLineAsync(stream, $"OK HELLO UDP={UdpPort}", ct);
+        var nonce = Guid.NewGuid().ToString("N")[..8];
+        await SendLineAsync(stream, $"CHALLENGE {nonce}", ct);
 
             while (!ct.IsCancellationRequested)
             {
@@ -140,7 +140,19 @@ public sealed class PhoneCamServer : IAsyncDisposable
 
                     Log($"TCP {remote}: {line}");
 
-                    if (line.Equals("PING", StringComparison.OrdinalIgnoreCase))
+                    if (line.StartsWith("HELLO", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                        if (parts.Length >= 2 && parts[1] == nonce)
+                        {
+                            await SendLineAsync(stream, $"ACK {nonce} UDP={UdpPort}", ct);
+                        }
+                        else
+                        {
+                            await SendLineAsync(stream, "ERR NONCE", ct);
+                        }
+                    }
+                    else if (line.Equals("PING", StringComparison.OrdinalIgnoreCase))
                         await SendLineAsync(stream, "PONG", ct);
                     else if (line.Equals("START", StringComparison.OrdinalIgnoreCase))
                         await SendLineAsync(stream, "OK START", ct);

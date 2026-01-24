@@ -6,8 +6,10 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
 import android.os.Build
+import android.os.Binder
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import kotlin.concurrent.thread
 
 /**
  * Foreground-service: Camera2 → MediaCodec(H.264) → UDP (PCAM framing).
@@ -15,11 +17,18 @@ import androidx.core.app.NotificationCompat
 class H264StreamService : Service() {
 
     private var streamer: UdpH264Streamer? = null
+    private var previewSurface: android.view.Surface? = null
 
-    override fun onBind(intent: Intent?): IBinder? = null
+    inner class LocalBinder : Binder() {
+        val service: H264StreamService
+            get() = this@H264StreamService
+    }
+
+    override fun onBind(intent: Intent?): IBinder = LocalBinder()
 
     override fun onCreate() {
         super.onCreate()
+        StreamState.log("Service created")
         startForeground(NOTIF_ID, buildNotification("Starting…"))
     }
 
@@ -35,24 +44,44 @@ class H264StreamService : Service() {
 
                 stopStreamerIfAny()
 
-                // IMPORTANT: UdpH264Streamer принимает параметры в start(...)
-                streamer = UdpH264Streamer(this).also {
-                    it.start(
-                        host = host,
-                        port = port,
-                        width = width,
-                        height = height,
-                        fps = fps,
-                        bitrate = bitrate
+                StreamState.updateStats(
+                    StreamStats(
+                        connectionState = "Starting",
+                        remote = "$host:$port"
                     )
-                }
+                )
 
-                val nm = getSystemService(NotificationManager::class.java)
-                nm.notify(NOTIF_ID, buildNotification("Streaming → $host:$port"))
+                thread(name = "PhoneCam-Control") {
+                    val udpPort = try {
+                        val negotiated = TcpControlClient.negotiate(host, 39000, width, height, fps, bitrate)
+                        negotiated?.udpPort ?: port
+                    } catch (ex: Throwable) {
+                        StreamState.log("Control: ${ex.message}")
+                        port
+                    }
+
+                    streamer = UdpH264Streamer(this).also { st ->
+                        st.setPreviewSurface(previewSurface)
+                        st.onLog = { StreamState.log(it) }
+                        st.onStats = { stats -> StreamState.updateStats(stats) }
+                        st.start(
+                            host = host,
+                            port = udpPort,
+                            width = width,
+                            height = height,
+                            fps = fps,
+                            bitrate = bitrate
+                        )
+                    }
+
+                    val nm = getSystemService(NotificationManager::class.java)
+                    nm.notify(NOTIF_ID, buildNotification("Streaming → $host:$udpPort"))
+                }
             }
 
             ACTION_STOP -> {
                 stopStreamerIfAny()
+                StreamState.updateStats(StreamStats(connectionState = "Stopped"))
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
             }
@@ -63,12 +92,18 @@ class H264StreamService : Service() {
 
     override fun onDestroy() {
         stopStreamerIfAny()
+        StreamState.log("Service destroyed")
         super.onDestroy()
     }
 
     private fun stopStreamerIfAny() {
         streamer?.stop()
         streamer = null
+    }
+
+    fun setPreviewSurface(surface: android.view.Surface?) {
+        previewSurface = surface
+        streamer?.setPreviewSurface(surface)
     }
 
     private fun buildNotification(text: String): Notification {

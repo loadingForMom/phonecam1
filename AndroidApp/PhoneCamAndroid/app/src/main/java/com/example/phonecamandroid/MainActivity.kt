@@ -1,24 +1,41 @@
 package com.example.phonecamandroid
 
 import android.Manifest
+import android.content.ComponentName
 import android.content.Intent
+import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.view.Surface
+import android.view.TextureView
 import android.widget.Button
+import android.widget.EditText
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat.startForegroundService
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var btnStart: Button
     private lateinit var btnStop: Button
-    private lateinit var txtLog: TextView
+    private lateinit var btnLogs: Button
+    private lateinit var btnBle: Button
+    private lateinit var txtStatus: TextView
+    private lateinit var edtHost: EditText
+    private lateinit var edtPort: EditText
+    private lateinit var previewView: TextureView
 
-    private var streaming = false
+    private var previewSurface: Surface? = null
+    private var service: H264StreamService? = null
+    private var bound = false
+
+    private val bleManager by lazy { BleHandshakeManager(this) }
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
@@ -27,18 +44,78 @@ class MainActivity : AppCompatActivity() {
             btnStart.isEnabled = ok
         }
 
+    private val serviceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, binder: android.os.IBinder?) {
+            val local = binder as? H264StreamService.LocalBinder
+            service = local?.service
+            bound = true
+            service?.setPreviewSurface(previewSurface)
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            bound = false
+            service = null
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
         btnStart = findViewById(R.id.btnStart)
         btnStop = findViewById(R.id.btnStop)
-        txtLog = findViewById(R.id.txtLog)
+        btnLogs = findViewById(R.id.btnLogs)
+        btnBle = findViewById(R.id.btnBle)
+        txtStatus = findViewById(R.id.txtStatus)
+        edtHost = findViewById(R.id.edtHost)
+        edtPort = findViewById(R.id.edtPort)
+        previewView = findViewById(R.id.previewView)
+
+        previewView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+            override fun onSurfaceTextureAvailable(surfaceTexture: android.graphics.SurfaceTexture, width: Int, height: Int) {
+                previewSurface = Surface(surfaceTexture)
+                service?.setPreviewSurface(previewSurface)
+            }
+
+            override fun onSurfaceTextureSizeChanged(surfaceTexture: android.graphics.SurfaceTexture, width: Int, height: Int) {}
+
+            override fun onSurfaceTextureDestroyed(surfaceTexture: android.graphics.SurfaceTexture): Boolean {
+                previewSurface?.release()
+                previewSurface = null
+                service?.setPreviewSurface(null)
+                return true
+            }
+
+            override fun onSurfaceTextureUpdated(surfaceTexture: android.graphics.SurfaceTexture) {}
+        }
 
         btnStart.setOnClickListener { startStreaming() }
         btnStop.setOnClickListener { stopStreaming() }
+        btnLogs.setOnClickListener { startActivity(Intent(this, LogsActivity::class.java)) }
+        btnBle.setOnClickListener { toggleBleScan() }
 
         ensurePermissions()
+
+        lifecycleScope.launch {
+            StreamState.stats.collectLatest { stats ->
+                txtStatus.text = "State=${stats.connectionState} FPS=${"%.1f".format(stats.fps)} " +
+                    "Bitrate=${"%.0f".format(stats.bitrateKbps)} kbps"
+            }
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        val intent = Intent(this, H264StreamService::class.java)
+        bindService(intent, serviceConnection, BIND_AUTO_CREATE)
+    }
+
+    override fun onStop() {
+        super.onStop()
+        if (bound) {
+            unbindService(serviceConnection)
+            bound = false
+        }
     }
 
     private fun ensurePermissions() {
@@ -50,6 +127,10 @@ class MainActivity : AppCompatActivity() {
         if (Build.VERSION.SDK_INT >= 33) {
             need.add(Manifest.permission.NEARBY_WIFI_DEVICES)
             need.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        if (Build.VERSION.SDK_INT >= 31) {
+            need.add(Manifest.permission.BLUETOOTH_SCAN)
+            need.add(Manifest.permission.BLUETOOTH_CONNECT)
         }
 
         val missing = need.filter { perm ->
@@ -68,10 +149,9 @@ class MainActivity : AppCompatActivity() {
     private fun startStreaming() {
         btnStart.isEnabled = false
         btnStop.isEnabled = true
-        streaming = true
 
-        val host = "192.168.137.1" // TODO: сделать ввод в UI
-        val port = 39010
+        val host = edtHost.text.toString().ifBlank { "192.168.137.1" }
+        val port = edtPort.text.toString().toIntOrNull() ?: 39010
 
         log("Starting service → $host:$port")
         val i = Intent(this, H264StreamService::class.java).apply {
@@ -89,7 +169,6 @@ class MainActivity : AppCompatActivity() {
     private fun stopStreaming() {
         btnStop.isEnabled = false
         btnStart.isEnabled = true
-        streaming = false
 
         log("Stopping…")
 
@@ -100,8 +179,17 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun log(s: String) {
-        runOnUiThread {
-            txtLog.append("\n$s")
+        StreamState.log(s)
+    }
+
+    private fun toggleBleScan() {
+        val serviceUuid = "0000feed-0000-1000-8000-00805f9b34fb"
+        if (bleManager.isScanning()) {
+            bleManager.stopScan()
+            btnBle.text = "BLE Scan"
+        } else {
+            bleManager.startScan(serviceUuid)
+            btnBle.text = "Stop BLE"
         }
     }
 }
