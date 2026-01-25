@@ -17,6 +17,7 @@ public sealed class BleHandshakeService
     private GattServiceProvider? _provider;
     private GattLocalCharacteristic? _handshakeCharacteristic;
     private string _payload = string.Empty;
+    private bool _payloadUpdatesAllowed = true;
 
     public bool IsRunning => _provider != null;
 
@@ -25,6 +26,7 @@ public sealed class BleHandshakeService
         if (_provider != null) return;
 
         _payload = payload;
+        _payloadUpdatesAllowed = true;
         var result = await GattServiceProvider.CreateAsync(ServiceUuid);
         if (result.Error != BluetoothError.Success)
         {
@@ -60,6 +62,17 @@ public sealed class BleHandshakeService
         Log("BLE: advertising started");
     }
 
+    public void UpdatePayload(string payload)
+    {
+        if (!_payloadUpdatesAllowed)
+        {
+            Log("BLE: payload updates blocked (not running)");
+            return;
+        }
+        _payload = payload;
+        Log("BLE: payload updated");
+    }
+
     public void Stop()
     {
         try
@@ -76,6 +89,7 @@ public sealed class BleHandshakeService
         {
             _handshakeCharacteristic = null;
             _provider = null;
+            _payloadUpdatesAllowed = false;
             Log("BLE: advertising stopped");
         }
     }

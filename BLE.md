@@ -1,36 +1,32 @@
 # PhoneCam BLE Handshake (MVP)
 
 ## Roles
-- **Windows laptop**: advertises GATT service + serves handshake payload.
-- **Android phone**: scans, connects, reads handshake characteristic, starts streaming.
+- **Windows laptop**: scans for phone BLE advertisements, enables hotspot, writes SSID/PSK to the phone.
+- **Android phone**: advertises GATT service + receives handshake write, then connects to Wi-Fi.
 
 ## Service + Characteristics
 - **Service UUID**: `0000feed-0000-1000-8000-00805f9b34fb`
-  - **Handshake Characteristic** (read): `0000feed-0001-1000-8000-00805f9b34fb`
+- **Handshake Characteristic** (write): `0000feed-0001-1000-8000-00805f9b34fb`
 
-Payload (UTF‑8):
+Payload (UTF‑8, written by Windows → Android):
 ```
-pcam;ver=1;tcp=39000;udp=39010;ssid=?;psk=?;nonce=<server_nonce>
+<ssid>|<psk>
 ```
 
 ## Nearby Detection
-- Android uses RSSI threshold with hysteresis:
-  - Start connect at RSSI >= ‑65 dBm
-  - Stop/ignore if RSSI <= ‑75 dBm
+- Windows uses BLE advertisements to detect proximity.
 
 ## Android Scaffolding
-- `BleHandshakeManager` uses `BluetoothLeScanner` to scan for service UUID.
-- On match, connect and read handshake characteristic (future TODO).
+- `BleHandshakeManager` advertises the service and hosts GATT server.
+- On write, parse credentials and connect to Wi‑Fi.
 
 ## Windows Scaffolding
-- `BleHandshakeService` uses `GattServiceProvider` to advertise and serve read responses.
-- Payload currently static string (TODO: inject SSID/PSK and server nonce).
+- `BleProvisioningClient` uses `BluetoothLEAdvertisementWatcher` to scan and connect.
+- Writes credentials to the phone's handshake characteristic.
 
 ## Hotspot Automation (Windows)
 Best effort:
-- Use WinRT `NetworkOperatorTetheringManager` (UWP/packaged apps).
-- In classic desktop, prompt the user to enable hotspot manually.
-  - MVP: detect hotspot interface and show instructions if not found.
+- Start hostednetwork via `netsh` (requires adapter support and privileges).
 
 Reference:  
 https://learn.microsoft.com/en-us/uwp/api/windows.networking.networkoperators.networkoperatortetheringmanager
