@@ -3,7 +3,7 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.INTERNET" />
-
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- Foreground Service (нужно для стрима в фоне / при погашенном экране) -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <!-- Android 14+ (targetSdk 34+) требует отдельные perms под типы FGS -->

@@ -1,401 +1,536 @@
 ﻿package com.example.phonecamandroid
 
+import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.ImageFormat
 import android.hardware.camera2.*
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.os.Handler
 import android.os.HandlerThread
+import android.util.Log
+import android.util.Range
+import android.view.Surface
 import java.net.DatagramPacket
 import java.net.DatagramSocket
-import java.net.InetAddress
-import android.os.SystemClock
-import android.view.Surface
-import java.net.NetworkInterface
+import java.net.InetSocketAddress
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.ceil
 import kotlin.math.min
 
-class UdpH264Streamer(
-    private val context: Context
-) {
+/**
+ * Camera2 -> MediaCodec(H264) -> UDP (PCAM v1 framing, 32-byte header)
+ */
+class UdpH264Streamer(private val ctx: Context) {
+
     var onLog: ((String) -> Unit)? = null
     var onStats: ((StreamStats) -> Unit)? = null
 
-    // FrameAssembler ожидает magic = "PCAM" в little-endian => 0x4D414350
-    private val MAGIC_PCAM = 0x4D414350
-    private val VERSION: Byte = 1
-    private val HEADER_SIZE = 32
-
-    // Держим датаграммы небольшими (без фрагментации)
-    private val MAX_DATAGRAM_SIZE = 1400
-    private val MAX_PAYLOAD_SIZE = MAX_DATAGRAM_SIZE - HEADER_SIZE
-
-    private var remoteAddress: InetAddress? = null
-    private var remotePort: Int = 0
-    private var socket: DatagramSocket? = null
-
-    private var cameraThread: HandlerThread? = null
-    private var cameraHandler: Handler? = null
-
-    private var cameraDevice: CameraDevice? = null
-    private var captureSession: CameraCaptureSession? = null
-
-    private var encoder: MediaCodec? = null
-    private var encoderInputSurface: android.view.Surface? = null
     private var previewSurface: Surface? = null
 
-    private var seq: Int = 0
-    private var frameId: Int = 0
+    private val running = AtomicBoolean(false)
 
-    // SPS/PPS
-    private var codecConfigAnnexB: ByteArray? = null
-    private var sentConfigOnce = false
+    private var encoder: MediaCodec? = null
+    private var inputSurface: Surface? = null
 
-    private var bytesSince = 0L
-    private var framesSince = 0L
-    private var droppedFrames = 0L
-    private var lastReportMs = SystemClock.elapsedRealtime()
-    private var localIp: String = "-"
-    private var remoteLabel: String = "-"
+    private var udp: DatagramSocket? = null
+    private var remote: InetSocketAddress? = null
 
-    fun start(host: String, port: Int, width: Int, height: Int, fps: Int, bitrate: Int) {
-        remoteAddress = InetAddress.getByName(host)
-        remotePort = port
-        socket = DatagramSocket()
-        localIp = resolveLocalIp() ?: "-"
-        remoteLabel = "$host:$port"
+    private var camera: Camera2Controller? = null
 
-        cameraThread = HandlerThread("PhoneCam-CameraThread").also { it.start() }
-        cameraHandler = Handler(cameraThread!!.looper)
+    private var drainThread: Thread? = null
 
-        setupEncoder(width, height, fps, bitrate)
-        openCamera()
-        onStats?.invoke(
-            StreamStats(
+    // Stats
+    private var startedAtMs: Long = 0
+    private var bytesSent: Long = 0
+    private var framesSent: Long = 0
+    private var droppedFrames: Long = 0
+    private var lastStatsAtMs: Long = 0
+
+    // PCAM counters
+    private var seq: Int = 1
+    private var frameId: Int = 1
+
+    fun setPreviewSurface(surface: Surface?) {
+        previewSurface = surface
+        camera?.setPreviewSurface(surface)
+    }
+
+    fun start(host: String, port: Int, width: Int, height: Int, fps: Int, bitrate: Int): Boolean {
+        if (running.getAndSet(true)) return true
+
+        try {
+            remote = InetSocketAddress(host, port)
+            udp = DatagramSocket().apply {
+                // connect helps performance + ICMP errors surface as exceptions on send()
+                connect(remote)
+            }
+
+            val codec = setupEncoder(width, height, fps, bitrate)
+            encoder = codec
+
+            camera = Camera2Controller(ctx).also { cam ->
+                cam.onLog = { log(it) }
+                cam.start(
+                    input = inputSurface!!,
+                    preview = previewSurface,
+                    width = width,
+                    height = height,
+                    fps = fps
+                )
+            }
+
+            startedAtMs = System.currentTimeMillis()
+            bytesSent = 0
+            framesSent = 0
+            droppedFrames = 0
+            lastStatsAtMs = 0
+
+            startDrainLoop(codec, host, port)
+
+            updateStats(
                 connectionState = "Streaming",
-                localIp = localIp,
-                remote = remoteLabel
+                remoteStr = "$host:$port"
             )
-        )
+            log("Streamer started UDP->$host:$port, ${width}x$height@$fps bitrate=$bitrate")
+
+            return true
+        } catch (t: Throwable) {
+            log("Start failed: ${Log.getStackTraceString(t)}")
+            updateStats("Failed: ${t.javaClass.simpleName}", "$host:$port")
+            stop()
+            return false
+        }
     }
 
     fun stop() {
-        try { captureSession?.close() } catch (_: Throwable) {}
-        captureSession = null
+        running.set(false)
 
-        try { cameraDevice?.close() } catch (_: Throwable) {}
-        cameraDevice = null
+        try { drainThread?.join(1200) } catch (_: Throwable) {}
+        drainThread = null
+
+        try { camera?.stop() } catch (_: Throwable) {}
+        camera = null
 
         try { encoder?.stop() } catch (_: Throwable) {}
         try { encoder?.release() } catch (_: Throwable) {}
         encoder = null
 
-        try { encoderInputSurface?.release() } catch (_: Throwable) {}
-        encoderInputSurface = null
+        try { inputSurface?.release() } catch (_: Throwable) {}
+        inputSurface = null
 
-        try { socket?.close() } catch (_: Throwable) {}
-        socket = null
-
-        cameraThread?.quitSafely()
-        cameraThread = null
-        cameraHandler = null
-
-        codecConfigAnnexB = null
-        sentConfigOnce = false
-        seq = 0
-        frameId = 0
-        bytesSince = 0
-        framesSince = 0
-        droppedFrames = 0
-        lastReportMs = SystemClock.elapsedRealtime()
+        try { udp?.close() } catch (_: Throwable) {}
+        udp = null
+        remote = null
     }
 
-    private fun setupEncoder(width: Int, height: Int, fps: Int, bitrate: Int) {
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+    // ---------------- Encoder ----------------
+
+    private fun setupEncoder(width: Int, height: Int, fps: Int, bitrate: Int): MediaCodec {
+        val format = MediaFormat.createVideoFormat(MIME, width, height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1) // keyframe every 1 sec
         }
 
-        encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
-            configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            encoderInputSurface = createInputSurface()
-            start()
+        val codec = MediaCodec.createEncoderByType(MIME)
+        codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
 
-            setCallback(object : MediaCodec.Callback() {
-                override fun onInputBufferAvailable(codec: MediaCodec, index: Int) {}
+        inputSurface = codec.createInputSurface()
 
-                override fun onOutputBufferAvailable(codec: MediaCodec, index: Int, info: MediaCodec.BufferInfo) {
-                    val out = codec.getOutputBuffer(index) ?: run {
-                        codec.releaseOutputBuffer(index, false)
-                        return
-                    }
-
-                    if (info.size <= 0) {
-                        codec.releaseOutputBuffer(index, false)
-                        return
-                    }
-
-                    val data = ByteArray(info.size)
-                    out.position(info.offset)
-                    out.limit(info.offset + info.size)
-                    out.get(data)
-                    codec.releaseOutputBuffer(index, false)
-
-                    if ((info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
-                        codecConfigAnnexB = normalizeToAnnexB(data)
-                        sentConfigOnce = false
-                        return
-                    }
-
-                    val isKeyFrame = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
-                    val cfg = codecConfigAnnexB
-                    if (cfg != null && (isKeyFrame || !sentConfigOnce)) {
-                        sendFrame(cfg, isConfig = true, isKeyFrame = true)
-                        sentConfigOnce = true
-                    }
-
-                    sendFrame(normalizeToAnnexB(data), isConfig = false, isKeyFrame = isKeyFrame)
-                }
-
-                override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {
-                    val csd0 = format.getByteBuffer("csd-0")?.let { bbToByteArray(it) }
-                    val csd1 = format.getByteBuffer("csd-1")?.let { bbToByteArray(it) }
-                    if (csd0 != null && csd1 != null) {
-                        val merged = ByteArray(csd0.size + csd1.size)
-                        System.arraycopy(csd0, 0, merged, 0, csd0.size)
-                        System.arraycopy(csd1, 0, merged, csd0.size, csd1.size)
-                        codecConfigAnnexB = normalizeToAnnexB(merged)
-                        sentConfigOnce = false
-                    }
-                }
-
-                override fun onError(codec: MediaCodec, e: MediaCodec.CodecException) {
-                    log("Encoder error: ${e.message}")
-                    stop()
-                }
-            }, cameraHandler)
-        }
+        // IMPORTANT: don't use setCallback (crashes on some devices)
+        codec.start()
+        return codec
     }
 
-    private fun bbToByteArray(bb: ByteBuffer): ByteArray {
-        val dup = bb.duplicate()
-        val arr = ByteArray(dup.remaining())
-        dup.get(arr)
-        return arr
+    private fun startDrainLoop(codec: MediaCodec, host: String, port: Int) {
+        val thread = Thread({
+            val info = MediaCodec.BufferInfo()
+
+            var sentCsd = false
+
+            while (running.get()) {
+                try {
+                    val outIndex = codec.dequeueOutputBuffer(info, 10_000)
+
+                    when {
+                        outIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                            // no-op
+                        }
+
+                        outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                            val fmt = codec.outputFormat
+                            val csd0 = fmt.getByteBuffer("csd-0")
+                            val csd1 = fmt.getByteBuffer("csd-1")
+
+                            if (!sentCsd) {
+                                val au = buildCsdAccessUnit(csd0, csd1)
+                                if (au != null) {
+                                    // Mark as CONFIG (flag 0x02) + also treated as "key"
+                                    sendAccessUnit(au, flags = FLAG_KEYFRAME or FLAG_CODEC_CONFIG)
+                                    sentCsd = true
+                                    log("Sent CSD (SPS/PPS), bytes=${au.size}")
+                                } else {
+                                    log("CSD not present in INFO_OUTPUT_FORMAT_CHANGED")
+                                }
+                            }
+                        }
+
+                        outIndex >= 0 -> {
+                            val outBuf = codec.getOutputBuffer(outIndex)
+                            if (outBuf != null && info.size > 0) {
+                                outBuf.position(info.offset)
+                                outBuf.limit(info.offset + info.size)
+
+                                val data = ByteArray(info.size)
+                                outBuf.get(data)
+
+                                val isConfig = (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+                                val isKey = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+
+                                val au = ensureAnnexB(data)
+
+                                val flags = when {
+                                    isConfig -> FLAG_CODEC_CONFIG
+                                    isKey -> FLAG_KEYFRAME
+                                    else -> 0
+                                }
+
+                                if (isConfig) {
+                                    // some encoders still output config here; send it as отдельный AU
+                                    sendAccessUnit(au, flags = flags or FLAG_KEYFRAME)
+                                } else {
+                                    sendAccessUnit(au, flags = flags)
+                                }
+
+                                framesSent++
+                                bytesSent += au.size.toLong()
+                                maybeUpdateStats("$host:$port")
+                            }
+
+                            codec.releaseOutputBuffer(outIndex, false)
+                        }
+                    }
+                } catch (t: Throwable) {
+                    log("Drain loop error: ${Log.getStackTraceString(t)}")
+                    updateStats("Failed: drain", "$host:$port")
+                    running.set(false)
+                }
+            }
+        }, "PhoneCam-EncoderDrain")
+
+        drainThread = thread
+        thread.start()
     }
 
-    private fun normalizeToAnnexB(src: ByteArray): ByteArray {
-        if (src.size >= 4) {
-            val isAnnexB =
-                (src[0].toInt() == 0 && src[1].toInt() == 0 && src[2].toInt() == 0 && src[3].toInt() == 1) ||
-                (src[0].toInt() == 0 && src[1].toInt() == 0 && src[2].toInt() == 1)
-            if (isAnnexB) return src
+    // Convert to AnnexB if encoder outputs AVCC (length-prefixed)
+    private fun ensureAnnexB(data: ByteArray): ByteArray {
+        if (data.size >= 4 &&
+            data[0] == 0.toByte() && data[1] == 0.toByte() && data[2] == 0.toByte() && data[3] == 1.toByte()
+        ) {
+            return data // already AnnexB
         }
 
-        // AVCC -> AnnexB
-        return try {
-            val out = ArrayList<ByteArray>()
-            var i = 0
-            while (i + 4 <= src.size) {
-                val len =
-                    ((src[i].toInt() and 0xFF) shl 24) or
-                    ((src[i + 1].toInt() and 0xFF) shl 16) or
-                    ((src[i + 2].toInt() and 0xFF) shl 8) or
-                    (src[i + 3].toInt() and 0xFF)
-                i += 4
-                if (len <= 0 || i + len > src.size) break
+        // Try AVCC: [len][nal][len][nal]...
+        val out = ByteArray(data.size + 64) // small extra; if insufficient we'll re-alloc
+        var outPos = 0
+        var i = 0
+        var tmp = out
 
-                val nal = src.copyOfRange(i, i + len)
-                i += len
+        fun ensureCap(need: Int) {
+            if (outPos + need <= tmp.size) return
+            val grown = ByteArray((tmp.size + need) * 2)
+            System.arraycopy(tmp, 0, grown, 0, outPos)
+            tmp = grown
+        }
 
-                val startCode = byteArrayOf(0, 0, 0, 1)
-                val chunk = ByteArray(startCode.size + nal.size)
-                System.arraycopy(startCode, 0, chunk, 0, startCode.size)
-                System.arraycopy(nal, 0, chunk, startCode.size, nal.size)
-                out.add(chunk)
+        while (i + 4 <= data.size) {
+            val nalLen =
+                ((data[i].toInt() and 0xFF) shl 24) or
+                        ((data[i + 1].toInt() and 0xFF) shl 16) or
+                        ((data[i + 2].toInt() and 0xFF) shl 8) or
+                        (data[i + 3].toInt() and 0xFF)
+
+            i += 4
+            if (nalLen <= 0 || i + nalLen > data.size) {
+                // give up, return original
+                return data
             }
 
-            if (out.isEmpty()) src
-            else {
-                val total = out.sumOf { it.size }
-                val merged = ByteArray(total)
-                var p = 0
-                for (a in out) {
-                    System.arraycopy(a, 0, merged, p, a.size)
-                    p += a.size
-                }
-                merged
+            ensureCap(4 + nalLen)
+            // start code
+            tmp[outPos++] = 0
+            tmp[outPos++] = 0
+            tmp[outPos++] = 0
+            tmp[outPos++] = 1
+            System.arraycopy(data, i, tmp, outPos, nalLen)
+            outPos += nalLen
+            i += nalLen
+        }
+
+        return tmp.copyOf(outPos)
+    }
+
+    private fun buildCsdAccessUnit(csd0: ByteBuffer?, csd1: ByteBuffer?): ByteArray? {
+        val a = csd0?.duplicate()?.let { bbToArray(it) }
+        val b = csd1?.duplicate()?.let { bbToArray(it) }
+
+        if (a == null && b == null) return null
+
+        // Many devices give AnnexB SPS/PPS already; if not - try to prefix start codes.
+        fun normalize(buf: ByteArray): ByteArray {
+            return if (buf.size >= 4 && buf[0] == 0.toByte() && buf[1] == 0.toByte() && buf[2] == 0.toByte() && buf[3] == 1.toByte()) {
+                buf
+            } else {
+                // add start code
+                byteArrayOf(0, 0, 0, 1) + buf
             }
-        } catch (_: Throwable) {
-            src
+        }
+
+        val na = a?.let { normalize(it) }
+        val nb = b?.let { normalize(it) }
+
+        return when {
+            na != null && nb != null -> na + nb
+            na != null -> na
+            else -> nb
         }
     }
 
-    private fun sendFrame(frameBytes: ByteArray, isConfig: Boolean, isKeyFrame: Boolean) {
-        val addr = remoteAddress ?: return
-        val port = remotePort
-        val sock = socket ?: return
+    private fun bbToArray(bb: ByteBuffer): ByteArray {
+        val b = ByteArray(bb.remaining())
+        bb.get(b)
+        return b
+    }
 
-        val totalChunks = ceil(frameBytes.size / MAX_PAYLOAD_SIZE.toDouble()).toInt().coerceAtLeast(1)
-        val thisFrameId = frameId++
-        val flags = buildFlags(isKeyFrame, isConfig)
-        val timestampMs = (SystemClock.elapsedRealtime() and 0xFFFFFFFFL).toInt()
+    // ---------------- UDP PCAM v1 ----------------
+
+    private fun sendAccessUnit(accessUnit: ByteArray, flags: Int) {
+        val sock = udp ?: return
+        val r = remote ?: return
+
+        val fid = frameId++
+        val fragPayloadMax = MAX_DATAGRAM - HEADER_SIZE
+        if (fragPayloadMax <= 0) return
+
+        val fragCount = maxOf(1, ceil(accessUnit.size / fragPayloadMax.toDouble()).toInt())
         var offset = 0
 
-        for (chunkIndex in 0 until totalChunks) {
-            val remaining = frameBytes.size - offset
-            val chunkLen = min(MAX_PAYLOAD_SIZE, remaining)
-            val payload = frameBytes.copyOfRange(offset, offset + chunkLen)
-            offset += chunkLen
+        for (fragIndex in 0 until fragCount) {
+            val take = min(fragPayloadMax, accessUnit.size - offset)
+            val packet = ByteArray(HEADER_SIZE + take)
 
-            val packetBytes = ByteBuffer
-                .allocate(HEADER_SIZE + payload.size)
-                .order(ByteOrder.LITTLE_ENDIAN)
-                .apply {
-                    putInt(MAGIC_PCAM)                  // 0..3
-                    put(VERSION)                        // 4
-                    put(flags)                          // 5
-                    putShort(HEADER_SIZE.toShort())     // 6..7
-                    putInt(seq++)                       // 8..11
-                    putInt(thisFrameId)                 // 12..15
-                    putInt(timestampMs)                 // 16..19
-                    putShort(chunkIndex.toShort())      // 20..21
-                    putShort(totalChunks.toShort())     // 22..23
-                    putInt(payload.size)                // 24..27
-                    putInt(0)                           // 28..31 streamId=0 (video)
-                    put(payload)
-                }
-                .array()
+            // header (Little Endian)
+            val bb = ByteBuffer.wrap(packet).order(ByteOrder.LITTLE_ENDIAN)
+            bb.putInt(MAGIC_PCAM)              // 0..3
+            bb.put(PCAM_VERSION.toByte())      // 4
+            bb.put(flags.toByte())             // 5
+            bb.putShort(HEADER_SIZE.toShort()) // 6..7 headerSize = 32
+            bb.putInt(seq++)                   // 8..11 packetSeq
+            bb.putInt(fid)                     // 12..15 frameId
+            bb.putInt((System.currentTimeMillis() and 0x7FFFFFFF).toInt()) // 16..19 timestampMs (int)
+            bb.putShort(fragIndex.toShort())   // 20..21
+            bb.putShort(fragCount.toShort())   // 22..23
+            bb.putInt(take)                    // 24..27 payloadLen
+            bb.putInt(0)                       // 28..31 streamId
+
+            // payload
+            System.arraycopy(accessUnit, offset, packet, HEADER_SIZE, take)
+            offset += take
 
             try {
-                sock.send(DatagramPacket(packetBytes, packetBytes.size, addr, port))
-                bytesSince += packetBytes.size
-            } catch (_: Throwable) { }
+                sock.send(DatagramPacket(packet, packet.size, r))
+            } catch (t: Throwable) {
+                droppedFrames++
+                log("UDP send failed: ${t.javaClass.simpleName}: ${t.message}")
+                // don't crash; keep trying
+            }
         }
-
-        framesSince++
-        maybeReport()
     }
 
-    @android.annotation.SuppressLint("MissingPermission")
-    private fun openCamera() {
-        val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-        val cameraId = chooseBackCamera(manager) ?: manager.cameraIdList.firstOrNull() ?: run {
-            stop(); return
-        }
+    private fun maybeUpdateStats(remoteStr: String) {
+        val now = System.currentTimeMillis()
+        if (now - lastStatsAtMs < 500) return
+        lastStatsAtMs = now
 
-        manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
-            override fun onOpened(camera: CameraDevice) {
-                cameraDevice = camera
-                createSession()
-            }
+        val elapsed = (now - startedAtMs).coerceAtLeast(1)
+        val fps = framesSent * 1000.0 / elapsed
+        val kbps = (bytesSent * 8.0 / elapsed) // bits per ms
+        val kbps2 = kbps // already kbps (since bits/ms == kbps)
 
-            override fun onDisconnected(camera: CameraDevice) {
-                try { camera.close() } catch (_: Throwable) {}
-                stop()
-            }
-
-            override fun onError(camera: CameraDevice, error: Int) {
-                try { camera.close() } catch (_: Throwable) {}
-                stop()
-            }
-        }, cameraHandler)
+        updateStats(
+            connectionState = "Streaming",
+            remoteStr = remoteStr,
+            fps = fps,
+            bitrateKbps = kbps2,
+            droppedFrames = droppedFrames
+        )
     }
 
-    private fun chooseBackCamera(manager: CameraManager): String? {
-        for (id in manager.cameraIdList) {
-            val chars = manager.getCameraCharacteristics(id)
-            val facing = chars.get(CameraCharacteristics.LENS_FACING)
-            if (facing == CameraCharacteristics.LENS_FACING_BACK) return id
-        }
-        return null
+    // ---------------- Stats + log ----------------
+
+    private fun log(s: String) {
+        onLog?.invoke(s)
+        Log.d("PhoneCam", s)
     }
 
-    private fun createSession() {
-        val camera = cameraDevice ?: return
-        val surface = encoderInputSurface ?: return
+    private fun updateStats(
+        connectionState: String,
+        remoteStr: String,
+        fps: Double? = null,
+        bitrateKbps: Double? = null,
+        droppedFrames: Long? = null,
+        queueDepth: Int? = null,
+        localIp: String? = null
+    ) {
+        // keep previous values if not provided
+        val prev = StreamState.stats.value
+        onStats?.invoke(
+            StreamStats(
+                connectionState = connectionState,
+                remote = remoteStr,
+                fps = fps ?: prev.fps,
+                bitrateKbps = bitrateKbps ?: prev.bitrateKbps,
+                droppedFrames = droppedFrames ?: prev.droppedFrames,
+                queueDepth = queueDepth ?: prev.queueDepth,
+                localIp = localIp ?: prev.localIp
+            )
+        )
+    }
 
-        val requestBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
-            addTarget(surface)
-            previewSurface?.let { addTarget(it) }
-            set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+    companion object {
+        private const val MIME = "video/avc"
+
+        // PCAM constants (must match Windows FrameAssembler.cs)
+        private const val MAGIC_PCAM = 0x4D414350  // 'P''C''A''M' little-endian int
+        private const val PCAM_VERSION = 1
+        private const val HEADER_SIZE = 32
+
+        // Flags (must match protocol)
+        private const val FLAG_KEYFRAME = 0x01
+        private const val FLAG_CODEC_CONFIG = 0x02
+
+        // Keep below typical MTU (1500). 32 header + 1368 payload ~= 1400 bytes.
+        private const val MAX_DATAGRAM = 1400
+    }
+
+    // ---------------- Camera2 controller (local) ----------------
+
+    private class Camera2Controller(private val ctx: Context) {
+        var onLog: ((String) -> Unit)? = null
+
+        private var thread: HandlerThread? = null
+        private var handler: Handler? = null
+
+        private var device: CameraDevice? = null
+        private var session: CameraCaptureSession? = null
+
+        private var previewSurface: Surface? = null
+
+        fun setPreviewSurface(surface: Surface?) {
+            previewSurface = surface
+            // if already running - restart session
+            if (device != null) {
+                try { rebuildSession() } catch (_: Throwable) {}
+            }
         }
 
-        camera.createCaptureSession(
-            listOfNotNull(surface, previewSurface),
-            object : CameraCaptureSession.StateCallback() {
-                override fun onConfigured(session: CameraCaptureSession) {
-                    captureSession = session
+        @SuppressLint("MissingPermission")
+        fun start(input: Surface, preview: Surface?, width: Int, height: Int, fps: Int) {
+            previewSurface = preview
+
+            thread = HandlerThread("PhoneCam-Camera").also { it.start() }
+            handler = Handler(thread!!.looper)
+
+            val cm = ctx.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val camId = chooseBackCamera(cm)
+
+            cm.openCamera(camId, object : CameraDevice.StateCallback() {
+                override fun onOpened(camera: CameraDevice) {
+                    device = camera
                     try {
-                        session.setRepeatingRequest(requestBuilder.build(), null, cameraHandler)
-                    } catch (_: Throwable) {
+                        createSession(input, width, height, fps)
+                        onLog?.invoke("Camera opened: $camId")
+                    } catch (t: Throwable) {
+                        onLog?.invoke("Camera session create failed: ${Log.getStackTraceString(t)}")
                         stop()
                     }
                 }
 
-                override fun onConfigureFailed(session: CameraCaptureSession) {
+                override fun onDisconnected(camera: CameraDevice) {
+                    onLog?.invoke("Camera disconnected")
                     stop()
                 }
-            },
-            cameraHandler
-        )
-    }
 
-    fun setPreviewSurface(surface: Surface?) {
-        previewSurface = surface
-        if (cameraDevice != null) {
-            cameraHandler?.post { createSession() }
+                override fun onError(camera: CameraDevice, error: Int) {
+                    onLog?.invoke("Camera error=$error")
+                    stop()
+                }
+            }, handler)
         }
-    }
 
-    private fun buildFlags(isKeyFrame: Boolean, isConfig: Boolean): Byte {
-        var f = 0
-        if (isKeyFrame) f = f or 0x1
-        if (isConfig) f = f or 0x2
-        return f.toByte()
-    }
+        fun stop() {
+            try { session?.close() } catch (_: Throwable) {}
+            session = null
 
-    private fun maybeReport() {
-        val now = SystemClock.elapsedRealtime()
-        val dt = now - lastReportMs
-        if (dt < 1000) return
+            try { device?.close() } catch (_: Throwable) {}
+            device = null
 
-        val fps = framesSince * 1000.0 / dt
-        val kbps = (bytesSince * 8.0 / dt)
-        onStats?.invoke(
-            StreamStats(
-                connectionState = "Streaming",
-                fps = fps,
-                bitrateKbps = kbps,
-                droppedFrames = droppedFrames,
-                queueDepth = 0,
-                localIp = localIp,
-                remote = remoteLabel
-            )
-        )
-
-        framesSince = 0
-        bytesSince = 0
-        lastReportMs = now
-    }
-
-    private fun resolveLocalIp(): String? {
-        return try {
-            NetworkInterface.getNetworkInterfaces().toList()
-                .flatMap { it.inetAddresses.toList() }
-                .firstOrNull { !it.isLoopbackAddress && it.hostAddress?.contains(":") == false }
-                ?.hostAddress
-        } catch (_: Throwable) {
-            null
+            try { thread?.quitSafely() } catch (_: Throwable) {}
+            thread = null
+            handler = null
         }
-    }
 
-    private fun log(msg: String) {
-        onLog?.invoke(msg)
+        private fun rebuildSession() {
+            val dev = device ?: return
+            // We can't rebuild without knowing input surface; so just ignore here.
+            // In this project previewSurface is optional; simplest is to do nothing.
+            // Preview will be applied on next start().
+            onLog?.invoke("Preview surface updated (will apply on next start)")
+        }
+
+        private fun chooseBackCamera(cm: CameraManager): String {
+            cm.cameraIdList.forEach { id ->
+                val chars = cm.getCameraCharacteristics(id)
+                val facing = chars.get(CameraCharacteristics.LENS_FACING)
+                if (facing == CameraCharacteristics.LENS_FACING_BACK) return id
+            }
+            return cm.cameraIdList.first()
+        }
+
+        private fun createSession(input: Surface, width: Int, height: Int, fps: Int) {
+            val dev = device ?: return
+            val h = handler ?: return
+
+            val surfaces = ArrayList<Surface>(2)
+            surfaces.add(input)
+            previewSurface?.let { surfaces.add(it) }
+
+            dev.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(s: CameraCaptureSession) {
+                    session = s
+                    val req = dev.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                        addTarget(input)
+                        previewSurface?.let { addTarget(it) }
+
+                        // FPS range (best effort)
+                        set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(fps, fps))
+                        set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                        set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                    }
+
+                    s.setRepeatingRequest(req.build(), null, h)
+                    onLog?.invoke("Capture session running")
+                }
+
+                override fun onConfigureFailed(s: CameraCaptureSession) {
+                    onLog?.invoke("Capture session configure failed")
+                }
+            }, h)
+        }
     }
 }

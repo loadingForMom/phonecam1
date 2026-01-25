@@ -21,30 +21,31 @@ object TcpControlClient {
         fps: Int,
         bitrate: Int
     ): ControlNegotiation? {
-        val socket = Socket()
-        socket.soTimeout = 4000
-        socket.connect(InetSocketAddress(host, port), 4000)
+        Socket().use { socket ->
+            socket.soTimeout = 4000
+            socket.connect(InetSocketAddress(host, port), 4000)
 
-        socket.getInputStream().use { input ->
-            socket.getOutputStream().use { output ->
-                val reader = BufferedReader(InputStreamReader(input))
-                val writer = PrintWriter(output, true)
+            socket.getInputStream().use { input ->
+                socket.getOutputStream().use { output ->
+                    val reader = BufferedReader(InputStreamReader(input))
+                    val writer = PrintWriter(output, true)
 
-                val challenge = reader.readLine() ?: return null
-                val parts = challenge.trim().split(" ")
-                if (parts.size < 2 || parts[0] != "CHALLENGE") return null
-                val nonce = parts[1]
+                    val challenge = reader.readLine() ?: return null
+                    val parts = challenge.trim().split(" ")
+                    if (parts.size < 2 || parts[0] != "CHALLENGE") return null
+                    val nonce = parts[1]
 
-                val clientNonce = UUID.randomUUID().toString().take(8)
-                writer.println("HELLO $nonce $clientNonce $width $height $fps $bitrate")
+                    val clientNonce = UUID.randomUUID().toString().take(8)
+                    writer.println("HELLO $nonce $clientNonce $width $height $fps $bitrate")
 
-                val ack = reader.readLine() ?: return null
-                val ackParts = ack.trim().split(" ")
-                if (ackParts.isEmpty() || ackParts[0] != "ACK") return null
+                    val ack = reader.readLine() ?: return null
+                    val ackParts = ack.trim().split(" ")
+                    if (ackParts.isEmpty() || ackParts[0] != "ACK") return null
 
-                val udpToken = ackParts.firstOrNull { it.startsWith("UDP=") } ?: return null
-                val udpPort = udpToken.removePrefix("UDP=").toIntOrNull() ?: return null
-                return ControlNegotiation(udpPort, nonce)
+                    val udpToken = ackParts.firstOrNull { it.startsWith("UDP=") } ?: return null
+                    val udpPort = udpToken.removePrefix("UDP=").toIntOrNull() ?: return null
+                    return ControlNegotiation(udpPort, nonce)
+                }
             }
         }
     }
