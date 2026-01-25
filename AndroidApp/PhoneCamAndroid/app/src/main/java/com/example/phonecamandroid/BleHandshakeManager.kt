@@ -15,6 +15,7 @@ import android.bluetooth.le.AdvertiseData
 import android.bluetooth.le.AdvertiseSettings
 import android.bluetooth.le.BluetoothLeAdvertiser
 import android.content.Context
+import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -25,6 +26,8 @@ import android.net.wifi.WifiNetworkSpecifier
 import android.os.Build
 import android.os.ParcelUuid
 import java.nio.charset.StandardCharsets
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.util.UUID
 
 class BleHandshakeManager(private val context: Context) {
@@ -32,6 +35,9 @@ class BleHandshakeManager(private val context: Context) {
         val SERVICE_UUID: UUID = UUID.fromString("0000feed-0000-1000-8000-00805f9b34fb")
         val HANDSHAKE_CHAR_UUID: UUID = UUID.fromString("0000feed-0001-1000-8000-00805f9b34fb")
         private const val CREDENTIALS_SEPARATOR = "|"
+        private const val DEFAULT_HOST = "192.168.137.1"
+        private const val DEFAULT_TCP = 39000
+        private const val DEFAULT_UDP = 39010
     }
 
     private val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
@@ -41,6 +47,7 @@ class BleHandshakeManager(private val context: Context) {
     private var gattServer: BluetoothGattServer? = null
     private var advertising = false
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var lastAutoStartNonce: String? = null
 
     fun isAdvertising(): Boolean = advertising
 
@@ -135,24 +142,34 @@ class BleHandshakeManager(private val context: Context) {
                 gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, null)
             }
 
-            val parts = payload.split(CREDENTIALS_SEPARATOR)
-            if (parts.size >= 2) {
-                val ssid = parts[0]
-                val password = parts[1]
-                Thread { connectToWifi(ssid, password) }.start()
-            } else {
+            val parsed = parsePayload(payload)
+            if (parsed == null) {
                 StreamState.log("BLE: invalid credential payload")
+                return
             }
+
+            StreamState.log(
+                "BLE: parsed ssid=${parsed.ssid} host=${parsed.host} tcp=${parsed.tcpPort} udp=${parsed.udpPort} " +
+                    "autostart=${parsed.autostart} nonce=${parsed.nonce ?: "-"}"
+            )
+            Thread { connectToWifi(parsed) }.start()
         }
     }
 
-    private fun connectToWifi(ssid: String, password: String) {
+    private fun connectToWifi(payload: HandshakePayload) {
+        val ssid = payload.ssid
+        val password = payload.psk
         val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
 
         if (!wifiManager.isWifiEnabled) {
             val enabled = wifiManager.setWifiEnabled(true)
             StreamState.log("Wi-Fi: enable requested result=$enabled")
+        }
+
+        if (payload.autostart && isWifiAlreadySuitable(cm, payload.host, payload.tcpPort)) {
+            StreamState.log("Wi-Fi: already connected; attempting autostart")
+            startStreamingIfNeeded(payload)
         }
 
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
@@ -175,6 +192,7 @@ class BleHandshakeManager(private val context: Context) {
             wifiManager.enableNetwork(netId, true)
             wifiManager.reconnect()
             StreamState.log("Wi-Fi: connecting (legacy) to $ssid")
+            scheduleLegacyAutostart(payload)
             return
         }
 
@@ -194,6 +212,9 @@ class BleHandshakeManager(private val context: Context) {
             override fun onAvailable(network: Network) {
                 cm.bindProcessToNetwork(network)
                 StreamState.log("Wi-Fi: connected to $ssid")
+                if (payload.autostart) {
+                    startStreamingIfNeeded(payload)
+                }
             }
 
             override fun onUnavailable() {
@@ -204,5 +225,131 @@ class BleHandshakeManager(private val context: Context) {
 
         cm.requestNetwork(request, callback)
         StreamState.log("Wi-Fi: request sent for $ssid")
+    }
+
+    private fun scheduleLegacyAutostart(payload: HandshakePayload) {
+        if (!payload.autostart) return
+        Thread {
+            try {
+                Thread.sleep(1200)
+            } catch (_: Throwable) {}
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            if (isWifiAlreadySuitable(cm, payload.host, payload.tcpPort)) {
+                startStreamingIfNeeded(payload)
+            } else {
+                StreamState.log("Wi-Fi: legacy autostart skipped (not yet connected)")
+            }
+        }.start()
+    }
+
+    private fun startStreamingIfNeeded(payload: HandshakePayload) {
+        val nonce = payload.nonce
+        if (nonce != null && nonce == lastAutoStartNonce) {
+            StreamState.log("Autostart: already handled nonce=$nonce")
+            return
+        }
+
+        val state = StreamState.stats.value.connectionState
+        val idleStates = setOf("Idle", "Stopped", "Failed", "Control failed", "Stream init failed")
+        if (state !in idleStates) {
+            StreamState.log("Autostart: skipped, state=$state")
+            return
+        }
+
+        lastAutoStartNonce = nonce
+        val intent = Intent(context, H264StreamService::class.java).apply {
+            action = H264StreamService.ACTION_START
+            putExtra(H264StreamService.EXTRA_HOST, payload.host)
+            putExtra(H264StreamService.EXTRA_PORT, payload.udpPort)
+            putExtra(H264StreamService.EXTRA_WIDTH, 1280)
+            putExtra(H264StreamService.EXTRA_HEIGHT, 720)
+            putExtra(H264StreamService.EXTRA_FPS, 30)
+            putExtra(H264StreamService.EXTRA_BITRATE, 2_000_000)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            context.startForegroundService(intent)
+        } else {
+            context.startService(intent)
+        }
+        StreamState.log("Autostart: requested streaming → ${payload.host}:${payload.udpPort}")
+    }
+
+    private fun isWifiAlreadySuitable(cm: ConnectivityManager, host: String, port: Int): Boolean {
+        val active = cm.activeNetwork ?: return false
+        val caps = cm.getNetworkCapabilities(active) ?: return false
+        if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return false
+
+        val probe = quickProbe(host, port, timeoutMs = 1500)
+        StreamState.log("Wi-Fi: probe $host:$port result=$probe")
+        return probe != ProbeResult.Timeout
+    }
+
+    private enum class ProbeResult { Success, Refused, Timeout, Error }
+
+    private fun quickProbe(host: String, port: Int, timeoutMs: Int): ProbeResult {
+        return try {
+            Socket().use { socket ->
+                socket.connect(InetSocketAddress(host, port), timeoutMs)
+                ProbeResult.Success
+            }
+        } catch (e: java.net.ConnectException) {
+            ProbeResult.Refused
+        } catch (e: java.net.SocketTimeoutException) {
+            ProbeResult.Timeout
+        } catch (_: Throwable) {
+            ProbeResult.Error
+        }
+    }
+
+    private data class HandshakePayload(
+        val ssid: String,
+        val psk: String,
+        val host: String,
+        val tcpPort: Int,
+        val udpPort: Int,
+        val autostart: Boolean,
+        val nonce: String?
+    )
+
+    private fun parsePayload(payload: String): HandshakePayload? {
+        val trimmed = payload.trim()
+        if (trimmed.contains("=")) {
+            val parts = trimmed.split(';')
+            val map = mutableMapOf<String, String>()
+            for (part in parts) {
+                val token = part.trim()
+                if (token.isEmpty() || token.equals("pcam", ignoreCase = true)) continue
+                val idx = token.indexOf('=')
+                if (idx <= 0) continue
+                val key = token.substring(0, idx).lowercase()
+                val value = token.substring(idx + 1)
+                map[key] = value
+            }
+
+            val ssid = map["ssid"] ?: return null
+            val psk = map["psk"] ?: return null
+            val host = map["host"] ?: DEFAULT_HOST
+            val tcp = map["tcp"]?.toIntOrNull() ?: DEFAULT_TCP
+            val udp = map["udp"]?.toIntOrNull() ?: DEFAULT_UDP
+            val autostart = map["autostart"]?.trim() == "1"
+            val nonce = map["nonce"]
+
+            return HandshakePayload(ssid, psk, host, tcp, udp, autostart, nonce)
+        }
+
+        val legacy = trimmed.split(CREDENTIALS_SEPARATOR)
+        if (legacy.size >= 2) {
+            return HandshakePayload(
+                ssid = legacy[0],
+                psk = legacy[1],
+                host = DEFAULT_HOST,
+                tcpPort = DEFAULT_TCP,
+                udpPort = DEFAULT_UDP,
+                autostart = true,
+                nonce = null
+            )
+        }
+
+        return null
     }
 }

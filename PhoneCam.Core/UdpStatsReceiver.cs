@@ -31,7 +31,14 @@ internal sealed class UdpStatsReceiver
         using var udp = new UdpClient(new IPEndPoint(IPAddress.Any, _port));
         udp.Client.ReceiveBufferSize = 4 * 1024 * 1024;
 
-        OnLog?.Invoke($"UDP stats listening on 0.0.0.0:{_port}");
+        try
+        {
+            OnLog?.Invoke($"UDP stats listening on 0.0.0.0:{_port}");
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine("UDP stats OnLog failed: " + ex);
+        }
 
         var lastTs = DateTime.UtcNow;
         long lastPackets = 0;

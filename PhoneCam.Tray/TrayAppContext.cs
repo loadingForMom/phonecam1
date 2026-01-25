@@ -1,7 +1,12 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -32,6 +37,7 @@ public sealed class TrayAppContext : ApplicationContext
     private Task? _decodeTask;
     private BleHandshakeService? _ble;
     private BleProvisioningClient? _bleClient;
+    private readonly bool _isAdmin;
 
     private const string HotspotSsid = "PhoneCamHotspot";
     private const string HotspotPsk = "PhoneCamPass123";
@@ -39,11 +45,14 @@ public sealed class TrayAppContext : ApplicationContext
     private static readonly string LogPath =
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "PhoneCam", "tray.log");
+    private static readonly object LogLock = new();
 
     public TrayAppContext()
     {
         Directory.CreateDirectory(Path.GetDirectoryName(LogPath)!);
+        _isAdmin = IsRunningAsAdmin();
         Log("Tray started");
+        Log($"Admin: {(_isAdmin ? "yes" : "no")}");
 
         _startItem = new ToolStripMenuItem("Start", null, (_, _) => Start());
         _stopItem = new ToolStripMenuItem("Stop", null, (_, _) => Stop()) { Enabled = false };
@@ -72,6 +81,10 @@ public sealed class TrayAppContext : ApplicationContext
 
         _tray.DoubleClick += (_, _) => Toggle();
         _tray.ShowBalloonTip(1000, "PhoneCam", "Tray started", ToolTipIcon.Info);
+        if (!_isAdmin)
+        {
+            _tray.ShowBalloonTip(2000, "PhoneCam", "Run as Administrator to start hotspot automatically.", ToolTipIcon.Warning);
+        }
 
         _ = StartBleProvisioningAsync();
     }
@@ -96,11 +109,12 @@ public sealed class TrayAppContext : ApplicationContext
         Log("Start clicked");
 
         _server = new PhoneCamServer();
-        _server.OnLog += Log;
+        _server.OnLog += LogSafe;
         _server.OnMediaStats += snap =>
             Log($"UDP: {snap.PacketsPerSec:F0} pkt/s, {(snap.BytesPerSec * 8 / 1000.0):F0} kbps, loss={snap.LossPerSec:F1}/s");
 
         _server.Start();
+        LogServerDiagnostics();
 
         StartDecodeLoop();
     }
@@ -222,12 +236,41 @@ public sealed class TrayAppContext : ApplicationContext
         Application.Exit();
     }
 
+    private void LogSafe(string msg)
+    {
+        try
+        {
+            Log(msg);
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine("Log failed: " + ex);
+        }
+    }
+
     private void Log(string msg)
     {
         var line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} {msg}";
-        File.AppendAllText(LogPath, line + Environment.NewLine);
-        Debug.WriteLine(line);
-        _logForm?.AppendLine(line);
+        lock (LogLock)
+        {
+            try
+            {
+                File.AppendAllText(LogPath, line + Environment.NewLine);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("File log failed: " + ex);
+            }
+        }
+        try
+        {
+            Debug.WriteLine(line);
+            _logForm?.AppendLine(line);
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine("UI log failed: " + ex);
+        }
     }
 
     private void ShowDebugConsole()
@@ -249,7 +292,7 @@ public sealed class TrayAppContext : ApplicationContext
     private async Task ToggleBleAsync()
     {
         _ble ??= new BleHandshakeService();
-        _ble.OnLog += Log;
+        _ble.OnLog += LogSafe;
 
         if (_ble.IsRunning)
         {
@@ -258,26 +301,109 @@ public sealed class TrayAppContext : ApplicationContext
             return;
         }
 
-        var payload = $"pcam;ver=1;tcp=39000;udp=39010;ssid={HotspotSsid};psk={HotspotPsk}";
+        var nonce = Guid.NewGuid().ToString("N")[..8];
+        var payload = $"ver=1;ssid={HotspotSsid};psk={HotspotPsk};tcp=39000;udp=39010;host=192.168.137.1;autostart=1;nonce={nonce}";
         await _ble.StartAsync(payload);
         _bleItem.Text = "Stop BLE Advertise";
     }
 
     private async Task StartBleProvisioningAsync()
     {
-        _bleClient ??= new BleProvisioningClient(Log);
+        _bleClient ??= new BleProvisioningClient(LogSafe, EnsureServerRunning, _isAdmin, ShowHotspotFallback);
         await _bleClient.StartAsync(HotspotSsid, HotspotPsk);
+    }
+
+    private void EnsureServerRunning()
+    {
+        if (_server is null)
+        {
+            Log("Server not running; starting before provisioning.");
+            Start();
+        }
+    }
+
+    private void ShowHotspotFallback(string reason)
+    {
+        try
+        {
+            _tray.ShowBalloonTip(4000, "PhoneCam", reason, ToolTipIcon.Warning);
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine("Balloon failed: " + ex);
+        }
+    }
+
+    private static bool IsRunningAsAdmin()
+    {
+        try
+        {
+            var identity = WindowsIdentity.GetCurrent();
+            var principal = new WindowsPrincipal(identity);
+            return principal.IsInRole(WindowsBuiltInRole.Administrator);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private void LogServerDiagnostics()
+    {
+        try
+        {
+            foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                foreach (var addr in nic.GetIPProperties().UnicastAddresses)
+                {
+                    if (addr.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                    {
+                        Log($"NET: {nic.Name} IPv4={addr.Address}");
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log("NET: interface scan failed: " + ex.Message);
+        }
+
+        try
+        {
+            var props = IPGlobalProperties.GetIPGlobalProperties();
+            var tcp = props.GetActiveTcpListeners();
+            var udp = props.GetActiveUdpListeners();
+            Log($"NET: TCP listeners={string.Join(", ", tcp)}");
+            Log($"NET: UDP listeners={string.Join(", ", udp)}");
+        }
+        catch (Exception ex)
+        {
+            Log("NET: listener scan failed: " + ex.Message);
+        }
     }
 
     private sealed class BleProvisioningClient
     {
         private readonly Action<string> _log;
+        private readonly Action _ensureServerRunning;
+        private readonly bool _isAdmin;
+        private readonly Action<string> _showFallback;
         private BluetoothLEAdvertisementWatcher? _watcher;
         private bool _connecting;
+        private bool _watcherRunning;
+        private DateTime _nextGlobalAttemptUtc = DateTime.MinValue;
+        private readonly Dictionary<ulong, DateTime> _nextDeviceAttemptUtc = new();
+        private readonly object _gate = new();
+        private readonly TimeSpan _deviceCooldown = TimeSpan.FromSeconds(30);
+        private readonly TimeSpan _failureCooldown = TimeSpan.FromSeconds(10);
+        private readonly TimeSpan _successCooldown = TimeSpan.FromSeconds(60);
 
-        public BleProvisioningClient(Action<string> log)
+        public BleProvisioningClient(Action<string> log, Action ensureServerRunning, bool isAdmin, Action<string> showFallback)
         {
             _log = log;
+            _ensureServerRunning = ensureServerRunning;
+            _isAdmin = isAdmin;
+            _showFallback = showFallback;
         }
 
         public async Task StartAsync(string ssid, string psk)
@@ -291,104 +417,148 @@ public sealed class TrayAppContext : ApplicationContext
 
             watcher.Received += async (_, args) =>
             {
-                if (_connecting) return;
-
-                foreach (var uuid in args.Advertisement.ServiceUuids)
+                try
                 {
-                    if (uuid == BleHandshakeService.ServiceUuid)
+                    if (_connecting) return;
+                    if (DateTime.UtcNow < _nextGlobalAttemptUtc) return;
+
+                    foreach (var uuid in args.Advertisement.ServiceUuids)
                     {
-                        _connecting = true;
-                        watcher.Stop();
-                        await HandleDeviceAsync(args.BluetoothAddress, ssid, psk);
-                        _connecting = false;
-                        watcher.Start();
-                        break;
+                        if (uuid == BleHandshakeService.ServiceUuid)
+                        {
+                            if (!CanAttempt(args.BluetoothAddress)) return;
+
+                            _connecting = true;
+                            StopWatcher();
+                            var success = await HandleDeviceAsync(args.BluetoothAddress, ssid, psk);
+                            _connecting = false;
+                            ScheduleWatcherRestart(success ? _successCooldown : _failureCooldown);
+                            break;
+                        }
                     }
+                }
+                catch (Exception ex)
+                {
+                    _connecting = false;
+                    _log("BLE: watcher error " + ex);
+                    ScheduleWatcherRestart(_failureCooldown);
                 }
             };
 
-            watcher.Start();
             _watcher = watcher;
+            StartWatcher();
             _log("BLE: scanning for phone advertisements");
         }
 
-        private async Task HandleDeviceAsync(ulong address, string ssid, string psk)
+        private async Task<bool> HandleDeviceAsync(ulong address, string ssid, string psk)
         {
             _log($"BLE: phone detected addr={address}");
+            _ensureServerRunning();
 
-            if (!StartHotspot(ssid, psk))
+            var hotspotStarted = StartHotspot(ssid, psk);
+            if (!hotspotStarted)
             {
                 _log("Hotspot: failed to start");
-                return;
+                MarkFailure(address);
             }
 
-            var device = await BluetoothLEDevice.FromBluetoothAddressAsync(address);
-            if (device == null)
+            try
             {
-                _log("BLE: failed to connect to device");
-                return;
-            }
+                using var device = await BluetoothLEDevice.FromBluetoothAddressAsync(address);
+                if (device == null)
+                {
+                    _log("BLE: failed to connect to device");
+                    MarkFailure(address);
+                    return false;
+                }
 
-            var serviceResult = await device.GetGattServicesForUuidAsync(BleHandshakeService.ServiceUuid);
-            if (serviceResult.Status != GattCommunicationStatus.Success || serviceResult.Services.Count == 0)
+                var serviceResult = await device.GetGattServicesForUuidAsync(BleHandshakeService.ServiceUuid);
+                if (serviceResult.Status != GattCommunicationStatus.Success || serviceResult.Services.Count == 0)
+                {
+                    _log($"BLE: service discovery failed status={serviceResult.Status}");
+                    MarkFailure(address);
+                    return false;
+                }
+
+                using var service = serviceResult.Services[0];
+                var charResult = await service.GetCharacteristicsForUuidAsync(BleHandshakeService.HandshakeCharacteristicUuid);
+                if (charResult.Status != GattCommunicationStatus.Success || charResult.Characteristics.Count == 0)
+                {
+                    _log($"BLE: characteristic discovery failed status={charResult.Status}");
+                    MarkFailure(address);
+                    return false;
+                }
+
+                var characteristic = charResult.Characteristics[0];
+                var writer = new DataWriter();
+                var nonce = Guid.NewGuid().ToString("N")[..8];
+                var payload = $"ver=1;ssid={ssid};psk={psk};tcp=39000;udp=39010;host=192.168.137.1;autostart=1;nonce={nonce}";
+                writer.WriteString(payload);
+                var status = await characteristic.WriteValueAsync(writer.DetachBuffer());
+                if (status == GattCommunicationStatus.Success)
+                {
+                    _log("BLE: credentials sent");
+                    if (hotspotStarted)
+                    {
+                        MarkSuccess(address);
+                    }
+                    return hotspotStarted;
+                }
+                else
+                {
+                    _log($"BLE: failed to send credentials status={status}");
+                    MarkFailure(address);
+                    return false;
+                }
+            }
+            catch (Exception ex)
             {
-                _log($"BLE: service discovery failed status={serviceResult.Status}");
-                return;
+                _log("BLE: provisioning error " + ex);
+                MarkFailure(address);
+                return false;
             }
-
-            var service = serviceResult.Services[0];
-            var charResult = await service.GetCharacteristicsForUuidAsync(BleHandshakeService.HandshakeCharacteristicUuid);
-            if (charResult.Status != GattCommunicationStatus.Success || charResult.Characteristics.Count == 0)
-            {
-                _log($"BLE: characteristic discovery failed status={charResult.Status}");
-                return;
-            }
-
-            var characteristic = charResult.Characteristics[0];
-            var writer = new DataWriter();
-            writer.WriteString($"{ssid}|{psk}");
-            var status = await characteristic.WriteValueAsync(writer.DetachBuffer());
-            _log(status == GattCommunicationStatus.Success
-                ? "BLE: credentials sent"
-                : $"BLE: failed to send credentials status={status}");
         }
 
         private bool StartHotspot(string ssid, string psk)
         {
             try
             {
-                var config = new ProcessStartInfo("netsh", $"wlan set hostednetwork mode=allow ssid=\"{ssid}\" key=\"{psk}\"")
+                if (!_isAdmin)
                 {
-                    CreateNoWindow = true,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true
-                };
-                using (var proc = Process.Start(config))
-                {
-                    proc?.WaitForExit();
-                    if (proc?.ExitCode != 0)
-                    {
-                        _log("Hotspot: netsh set hostednetwork failed");
-                        return false;
-                    }
+                    _log("Hotspot: not running as admin; cannot start hostednetwork.");
+                    _showFallback("Run as Administrator or enable Mobile Hotspot manually.");
+                    return false;
                 }
 
-                var start = new ProcessStartInfo("netsh", "wlan start hostednetwork")
+                if (!IsHostedNetworkSupported())
                 {
-                    CreateNoWindow = true,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true
-                };
-                using (var proc = Process.Start(start))
-                {
-                    proc?.WaitForExit();
-                    if (proc?.ExitCode != 0)
+                    _log("Hotspot: hosted network unsupported by driver.");
+                    if (IsAppPackaged())
                     {
-                        _log("Hotspot: netsh start hostednetwork failed");
-                        return false;
+                        _log("Hotspot: app is packaged, but Mobile Hotspot API not wired.");
                     }
+                    else
+                    {
+                        _log("Hotspot: app not packaged; WinRT tethering API unavailable.");
+                    }
+                    _showFallback("Hosted network unsupported. Enable Mobile Hotspot manually.");
+                    return false;
+                }
+
+                var config = RunNetsh($"wlan set hostednetwork mode=allow ssid=\"{ssid}\" key=\"{psk}\"");
+                LogNetshResult("Hotspot: netsh set hostednetwork", config);
+                if (config.ExitCode != 0)
+                {
+                    ReportHotspotFailure(config);
+                    return false;
+                }
+
+                var start = RunNetsh("wlan start hostednetwork");
+                LogNetshResult("Hotspot: netsh start hostednetwork", start);
+                if (start.ExitCode != 0)
+                {
+                    ReportHotspotFailure(start);
+                    return false;
                 }
 
                 _log($"Hotspot: started ssid={ssid}");
@@ -399,6 +569,148 @@ public sealed class TrayAppContext : ApplicationContext
                 _log("Hotspot: exception " + ex.Message);
                 return false;
             }
+        }
+
+        private static (int ExitCode, string StdOut, string StdErr) RunNetsh(string args)
+        {
+            var info = new ProcessStartInfo("netsh", args)
+            {
+                CreateNoWindow = true,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+            using var proc = Process.Start(info);
+            if (proc == null)
+            {
+                return (-1, string.Empty, "Failed to start netsh process");
+            }
+            var stdout = proc.StandardOutput.ReadToEnd();
+            var stderr = proc.StandardError.ReadToEnd();
+            proc.WaitForExit();
+            return (proc.ExitCode, stdout, stderr);
+        }
+
+        private void LogNetshResult(string prefix, (int ExitCode, string StdOut, string StdErr) result)
+        {
+            _log($"{prefix}: exit={result.ExitCode}");
+            if (!string.IsNullOrWhiteSpace(result.StdOut))
+            {
+                _log($"{prefix} stdout: {result.StdOut.Trim()}");
+            }
+            if (!string.IsNullOrWhiteSpace(result.StdErr))
+            {
+                _log($"{prefix} stderr: {result.StdErr.Trim()}");
+            }
+        }
+
+        private void ReportHotspotFailure((int ExitCode, string StdOut, string StdErr) result)
+        {
+            var combined = $"{result.StdOut}\n{result.StdErr}".ToLowerInvariant();
+            if (combined.Contains("requires elevation") || combined.Contains("access is denied"))
+            {
+                _log("Hotspot: netsh failed (admin required).");
+                _showFallback("Run as Administrator to start hotspot.");
+                return;
+            }
+            if (combined.Contains("hosted network supported") && combined.Contains("no"))
+            {
+                _log("Hotspot: hosted network not supported.");
+                _showFallback("Hosted network unsupported. Enable Mobile Hotspot manually.");
+                return;
+            }
+            if (combined.Contains("wlan autoconfig") || combined.Contains("wlansvc") || combined.Contains("service has not been started"))
+            {
+                _log("Hotspot: WLAN AutoConfig service not running.");
+                _showFallback("Start WLAN AutoConfig service or enable Mobile Hotspot manually.");
+            }
+        }
+
+        private bool IsHostedNetworkSupported()
+        {
+            var res = RunNetsh("wlan show drivers");
+            LogNetshResult("Hotspot: netsh show drivers", res);
+            var text = $"{res.StdOut}\n{res.StdErr}".Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (var line in text)
+            {
+                if (line.IndexOf("Hosted network supported", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return line.IndexOf("Yes", StringComparison.OrdinalIgnoreCase) >= 0;
+                }
+            }
+            return true;
+        }
+
+        private static bool IsAppPackaged()
+        {
+            const int APPMODEL_ERROR_NO_PACKAGE = 15700;
+            var length = 0;
+            var result = GetCurrentPackageFullName(ref length, null);
+            return result != APPMODEL_ERROR_NO_PACKAGE;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern int GetCurrentPackageFullName(ref int packageFullNameLength, char[]? packageFullName);
+
+        private bool CanAttempt(ulong address)
+        {
+            lock (_gate)
+            {
+                if (_nextDeviceAttemptUtc.TryGetValue(address, out var next) && DateTime.UtcNow < next)
+                {
+                    return false;
+                }
+                return true;
+            }
+        }
+
+        private void MarkFailure(ulong address)
+        {
+            lock (_gate)
+            {
+                _nextDeviceAttemptUtc[address] = DateTime.UtcNow + _failureCooldown;
+                _nextGlobalAttemptUtc = DateTime.UtcNow + _failureCooldown;
+            }
+        }
+
+        private void MarkSuccess(ulong address)
+        {
+            lock (_gate)
+            {
+                _nextDeviceAttemptUtc[address] = DateTime.UtcNow + _deviceCooldown;
+                _nextGlobalAttemptUtc = DateTime.UtcNow + _successCooldown;
+            }
+        }
+
+        private void StartWatcher()
+        {
+            if (_watcher == null || _watcherRunning) return;
+            _watcher.Start();
+            _watcherRunning = true;
+        }
+
+        private void StopWatcher()
+        {
+            if (_watcher == null || !_watcherRunning) return;
+            _watcher.Stop();
+            _watcherRunning = false;
+        }
+
+        private void ScheduleWatcherRestart(TimeSpan delay)
+        {
+            if (_watcher == null) return;
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(delay);
+                    StartWatcher();
+                }
+                catch (Exception ex)
+                {
+                    _log("BLE: watcher restart failed " + ex);
+                }
+            });
         }
     }
 

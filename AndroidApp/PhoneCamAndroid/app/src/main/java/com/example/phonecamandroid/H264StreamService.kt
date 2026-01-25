@@ -11,6 +11,7 @@ import android.net.LinkAddress
 import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Binder
 import android.os.IBinder
@@ -19,6 +20,8 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import java.net.Inet4Address
 import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
 import kotlin.concurrent.thread
 import kotlin.math.max
 
@@ -301,9 +304,23 @@ class H264StreamService : Service() {
         val deadline = System.currentTimeMillis() + max(0L, timeoutMs)
 
         val hostAddr: InetAddress? = try { InetAddress.getByName(host) } catch (_: Throwable) { null }
+        logWifiDiagnostics(cm, hostAddr, host)
+
+        val immediate = findWifiNetworkForHost(cm, hostAddr, host, 39000)
+        if (immediate != null) {
+            if (boundNetwork != immediate) {
+                if (bindProcessNetwork(cm, immediate)) {
+                    boundNetwork = immediate
+                    StreamState.log("Network bound to Wi-Fi: $immediate")
+                } else {
+                    StreamState.log("Failed to bind process to Wi-Fi network")
+                }
+            }
+            return true
+        }
 
         while (System.currentTimeMillis() <= deadline) {
-            val wifi = findWifiNetworkForHost(cm, hostAddr)
+            val wifi = findWifiNetworkForHost(cm, hostAddr, host, 39000)
             if (wifi != null) {
                 if (boundNetwork != wifi) {
                     if (bindProcessNetwork(cm, wifi)) {
@@ -325,7 +342,12 @@ class H264StreamService : Service() {
         return false
     }
 
-    private fun findWifiNetworkForHost(cm: ConnectivityManager, hostAddr: InetAddress?): Network? {
+    private fun findWifiNetworkForHost(
+        cm: ConnectivityManager,
+        hostAddr: InetAddress?,
+        host: String,
+        port: Int
+    ): Network? {
         val nets = try { cm.allNetworks } catch (_: Throwable) { emptyArray<Network>() }
         if (nets.isEmpty()) return null
 
@@ -334,7 +356,7 @@ class H264StreamService : Service() {
             val caps = cm.getNetworkCapabilities(n) ?: return@firstOrNull false
             if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return@firstOrNull false
             val lp = cm.getLinkProperties(n) ?: return@firstOrNull false
-            isHostOnSameSubnet(hostAddr, lp)
+            isHostOnSameSubnet(hostAddr, lp) || hasRouteToHost(hostAddr, lp)
         }
         if (preferred != null) return preferred
 
@@ -344,7 +366,11 @@ class H264StreamService : Service() {
             caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
                     caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_SUSPENDED)
         }
-        if (anyWifi != null) return anyWifi
+        if (anyWifi != null) {
+            if (quickProbe(anyWifi, host, port) != ProbeResult.Timeout) {
+                return anyWifi
+            }
+        }
 
         // Last resort: active network if it is Wi-Fi
         val active = cm.activeNetwork ?: return null
@@ -366,6 +392,60 @@ class H264StreamService : Service() {
             if (netA == netH) return true
         }
         return false
+    }
+
+    private fun hasRouteToHost(hostAddr: InetAddress?, lp: LinkProperties): Boolean {
+        if (hostAddr == null) return false
+        return lp.routes.any { route ->
+            route.destination?.contains(hostAddr) == true
+        }
+    }
+
+    private enum class ProbeResult { Success, Refused, Timeout, Error }
+
+    private fun quickProbe(network: Network, host: String, port: Int): ProbeResult {
+        return try {
+            val socket = network.socketFactory.createSocket()
+            socket.use { it.connect(InetSocketAddress(host, port), 1500) }
+            StreamState.log("Probe: $host:$port success via $network")
+            ProbeResult.Success
+        } catch (e: java.net.ConnectException) {
+            StreamState.log("Probe: $host:$port refused via $network")
+            ProbeResult.Refused
+        } catch (e: java.net.SocketTimeoutException) {
+            StreamState.log("Probe: $host:$port timeout via $network")
+            ProbeResult.Timeout
+        } catch (e: Throwable) {
+            StreamState.log("Probe: $host:$port error ${e.message}")
+            ProbeResult.Error
+        }
+    }
+
+    private fun logWifiDiagnostics(cm: ConnectivityManager, hostAddr: InetAddress?, host: String) {
+        try {
+            val active = cm.activeNetwork
+            val caps = active?.let { cm.getNetworkCapabilities(it) }
+            val lp = active?.let { cm.getLinkProperties(it) }
+            val transport = when {
+                caps == null -> "none"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "WIFI"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "CELLULAR"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ETHERNET"
+                else -> "OTHER"
+            }
+
+            val wifiManager = applicationContext.getSystemService(WifiManager::class.java)
+            val ssid = try { wifiManager?.connectionInfo?.ssid ?: "-" } catch (_: Throwable) { "-" }
+
+            val localIp = lp?.linkAddresses?.firstOrNull { it.address is Inet4Address }?.address?.hostAddress ?: "-"
+            val onSubnet = lp?.let { isHostOnSameSubnet(hostAddr, it) } == true
+            StreamState.log("Wi-Fi diag: active=$transport ssid=$ssid localIp=$localIp host=$host sameSubnet=$onSubnet")
+            if (active != null && caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true) {
+                quickProbe(active, host, 39000)
+            }
+        } catch (t: Throwable) {
+            StreamState.log("Wi-Fi diag failed: ${t.message}")
+        }
     }
 
     private fun ipv4ToInt(a: Inet4Address): Int {
