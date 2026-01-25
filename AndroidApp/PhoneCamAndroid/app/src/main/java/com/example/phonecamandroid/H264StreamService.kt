@@ -6,13 +6,21 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.LinkAddress
+import android.net.LinkProperties
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Binder
 import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import java.net.Inet4Address
+import java.net.InetAddress
 import kotlin.concurrent.thread
+import kotlin.math.max
 
 class H264StreamService : Service() {
 
@@ -20,6 +28,9 @@ class H264StreamService : Service() {
     private var previewSurface: android.view.Surface? = null
 
     private var wakeLock: PowerManager.WakeLock? = null
+
+    // Keep process pinned to a specific Wi-Fi network (hotspot) while streaming
+    private var boundNetwork: Network? = null
 
     inner class LocalBinder : Binder() {
         val service: H264StreamService
@@ -46,7 +57,7 @@ class H264StreamService : Service() {
         startFgSafe(buildNotification("Starting…"))
 
         val host = intent.getStringExtra(EXTRA_HOST) ?: "192.168.137.1"
-        val port = intent.getIntExtra(EXTRA_PORT, 39010)
+        val port = intent.getIntExtra(EXTRA_PORT, 39010) // UDP port (display)
         val width = intent.getIntExtra(EXTRA_WIDTH, 1280)
         val height = intent.getIntExtra(EXTRA_HEIGHT, 720)
         val fps = intent.getIntExtra(EXTRA_FPS, 30)
@@ -57,19 +68,30 @@ class H264StreamService : Service() {
         StreamState.updateStats(StreamStats(connectionState = "Starting", remote = "$host:$port"))
 
         acquireWakeLock()
-
-        // (опционально) проверка root — НЕ обязательна для камеры/кодека,
-        // но ты хотел видеть что root реально есть
         runSuCheck()
 
         val worker = thread(start = true, name = "PhoneCam-Control") {
             try {
-                val negotiated = try {
-                    TcpControlClient.negotiate(host, 39000, width, height, fps, bitrate)
-                } catch (ex: Throwable) {
-                    logException("Control failed to connect", ex)
-                    null
+                // 1) Force routing via the correct Wi-Fi network (hotspot), otherwise Android may pick mobile data
+                notifyStatus("Binding network…")
+                val pinned = ensureBoundToBestWifiNetworkForHost(host, timeoutMs = 10_000)
+                if (!pinned) {
+                    failAndStop("Failed: no Wi-Fi route to $host", host, port)
+                    return@thread
                 }
+
+                // 2) Robust negotiation with retries (handles transient ENETUNREACH during Wi-Fi transitions)
+                notifyStatus("Connecting…")
+                val negotiated = negotiateWithRetries(
+                    host = host,
+                    controlPort = 39000,
+                    width = width,
+                    height = height,
+                    fps = fps,
+                    bitrate = bitrate,
+                    attempts = 6,
+                    baseDelayMs = 350
+                )
 
                 if (negotiated == null) {
                     failAndStop("Control failed", host, port)
@@ -114,10 +136,54 @@ class H264StreamService : Service() {
         }
     }
 
+    private fun negotiateWithRetries(
+        host: String,
+        controlPort: Int,
+        width: Int,
+        height: Int,
+        fps: Int,
+        bitrate: Int,
+        attempts: Int,
+        baseDelayMs: Long
+    ): ControlNegotiation? {
+        var lastErr: Throwable? = null
+
+        for (i in 1..attempts) {
+            // Re-pin network each attempt (covers cases when OS rebinds due to Wi-Fi switching)
+            ensureBoundToBestWifiNetworkForHost(host, timeoutMs = 2_500)
+
+            try {
+                StreamState.log("Control connect attempt $i/$attempts → $host:$controlPort")
+
+                val negotiated = TcpControlClient.negotiate(host, controlPort, width, height, fps, bitrate)
+                if (negotiated == null) {
+                    // Treat "null" as a failed attempt too (protocol mismatch / readLine null etc.)
+                    throw IllegalStateException("Negotiate returned null")
+                }
+
+                StreamState.log("Control negotiated: udpPort=${negotiated.udpPort}")
+                return negotiated
+            } catch (t: Throwable) {
+                lastErr = t
+                logException("Control connect failed (attempt $i/$attempts)", t)
+
+                // Backoff: 350ms, 700ms, 1050ms, ...
+                val sleepMs = baseDelayMs * i
+                try { Thread.sleep(sleepMs) } catch (_: Throwable) {}
+            }
+        }
+
+        if (lastErr != null) {
+            logException("Control failed after $attempts attempts", lastErr)
+        }
+        return null
+    }
+
     private fun failAndStop(msg: String, host: String, port: Int) {
         StreamState.updateStats(StreamStats(connectionState = msg, remote = "$host:$port"))
         stopStreamerIfAny()
         releaseWakeLock()
+        unbindProcessNetwork()
         stopForeground(STOP_FOREGROUND_REMOVE)
         notifyStatus(msg)
         stopSelf()
@@ -127,6 +193,7 @@ class H264StreamService : Service() {
         stopStreamerIfAny()
         StreamState.updateStats(StreamStats(connectionState = state))
         releaseWakeLock()
+        unbindProcessNetwork()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
@@ -134,6 +201,7 @@ class H264StreamService : Service() {
     override fun onDestroy() {
         stopStreamerIfAny()
         releaseWakeLock()
+        unbindProcessNetwork()
         StreamState.log("Service destroyed")
         super.onDestroy()
     }
@@ -148,7 +216,7 @@ class H264StreamService : Service() {
             val pm = getSystemService(PowerManager::class.java)
             val wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PhoneCam:stream")
             wl.setReferenceCounted(false)
-            wl.acquire(60 * 60 * 1000L) // 1 час, потом можно продлевать
+            wl.acquire(60 * 60 * 1000L) // 1 hour
             wakeLock = wl
             StreamState.log("WakeLock acquired")
         } catch (t: Throwable) {
@@ -161,6 +229,7 @@ class H264StreamService : Service() {
             wakeLock?.let { if (it.isHeld) it.release() }
         } catch (_: Throwable) { }
         wakeLock = null
+        StreamState.log("WakeLock released")
     }
 
     private fun runSuCheck() {
@@ -221,6 +290,121 @@ class H264StreamService : Service() {
             .setContentText(text)
             .setOngoing(true)
             .build()
+    }
+
+    /**
+     * Ensure traffic goes via the Wi-Fi network that actually has a route to [host].
+     * This prevents Android from trying to connect via mobile data / other Wi-Fi and producing ENETUNREACH.
+     */
+    private fun ensureBoundToBestWifiNetworkForHost(host: String, timeoutMs: Long): Boolean {
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return false
+        val deadline = System.currentTimeMillis() + max(0L, timeoutMs)
+
+        val hostAddr: InetAddress? = try { InetAddress.getByName(host) } catch (_: Throwable) { null }
+
+        while (System.currentTimeMillis() <= deadline) {
+            val wifi = findWifiNetworkForHost(cm, hostAddr)
+            if (wifi != null) {
+                if (boundNetwork != wifi) {
+                    if (bindProcessNetwork(cm, wifi)) {
+                        boundNetwork = wifi
+                        StreamState.log("Network bound to Wi-Fi: $wifi")
+                    } else {
+                        StreamState.log("Failed to bind process to Wi-Fi network")
+                        // continue retry
+                    }
+                }
+                return true
+            }
+
+            // no suitable Wi-Fi network yet (Wi-Fi connecting / hotspot switching)
+            try { Thread.sleep(200) } catch (_: Throwable) {}
+        }
+
+        StreamState.log("No suitable Wi-Fi network found for host=$host within ${timeoutMs}ms")
+        return false
+    }
+
+    private fun findWifiNetworkForHost(cm: ConnectivityManager, hostAddr: InetAddress?): Network? {
+        val nets = try { cm.allNetworks } catch (_: Throwable) { emptyArray<Network>() }
+        if (nets.isEmpty()) return null
+
+        // Prefer Wi-Fi networks that are on the same subnet as the host (best for hotspot 192.168.137.x)
+        val preferred = nets.firstOrNull { n ->
+            val caps = cm.getNetworkCapabilities(n) ?: return@firstOrNull false
+            if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return@firstOrNull false
+            val lp = cm.getLinkProperties(n) ?: return@firstOrNull false
+            isHostOnSameSubnet(hostAddr, lp)
+        }
+        if (preferred != null) return preferred
+
+        // Fallback: any Wi-Fi network that is not suspended
+        val anyWifi = nets.firstOrNull { n ->
+            val caps = cm.getNetworkCapabilities(n) ?: return@firstOrNull false
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
+                    caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_SUSPENDED)
+        }
+        if (anyWifi != null) return anyWifi
+
+        // Last resort: active network if it is Wi-Fi
+        val active = cm.activeNetwork ?: return null
+        val caps = cm.getNetworkCapabilities(active) ?: return null
+        return if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) active else null
+    }
+
+    private fun isHostOnSameSubnet(hostAddr: InetAddress?, lp: LinkProperties): Boolean {
+        val host4 = hostAddr as? Inet4Address ?: return false
+        val hostInt = ipv4ToInt(host4)
+
+        for (la: LinkAddress in lp.linkAddresses) {
+            val addr4 = la.address as? Inet4Address ?: continue
+            val prefix = la.prefixLength
+            if (prefix <= 0 || prefix > 32) continue
+            val mask = prefixToMask(prefix)
+            val netA = ipv4ToInt(addr4) and mask
+            val netH = hostInt and mask
+            if (netA == netH) return true
+        }
+        return false
+    }
+
+    private fun ipv4ToInt(a: Inet4Address): Int {
+        val b = a.address
+        return ((b[0].toInt() and 0xFF) shl 24) or
+                ((b[1].toInt() and 0xFF) shl 16) or
+                ((b[2].toInt() and 0xFF) shl 8) or
+                (b[3].toInt() and 0xFF)
+    }
+
+    private fun prefixToMask(prefix: Int): Int {
+        return if (prefix == 0) 0 else (-1 shl (32 - prefix))
+    }
+
+    private fun bindProcessNetwork(cm: ConnectivityManager, network: Network): Boolean {
+        return try {
+            when {
+                Build.VERSION.SDK_INT >= 23 -> cm.bindProcessToNetwork(network)
+                Build.VERSION.SDK_INT >= 21 -> ConnectivityManager.setProcessDefaultNetwork(network)
+                else -> true
+            }
+        } catch (t: Throwable) {
+            StreamState.log("bindProcessNetwork failed: ${t.message}")
+            false
+        }
+    }
+
+    private fun unbindProcessNetwork() {
+        val cm = try { getSystemService(ConnectivityManager::class.java) } catch (_: Throwable) { null }
+        try {
+            if (cm != null) {
+                when {
+                    Build.VERSION.SDK_INT >= 23 -> cm.bindProcessToNetwork(null)
+                    Build.VERSION.SDK_INT >= 21 -> ConnectivityManager.setProcessDefaultNetwork(null)
+                }
+            }
+        } catch (_: Throwable) {
+        }
+        boundNetwork = null
     }
 
     companion object {
