@@ -85,7 +85,7 @@ internal static class FfmpegBootstrap
                 return BuildDiagnostics(null, ResolveLibraries(null), null);
 
             var libraryMap = ResolveLibraries(nativeDir);
-            int? version = null;
+            uint? version = null;
 
             try
             {
@@ -151,7 +151,7 @@ internal static class FfmpegBootstrap
         return map;
     }
 
-    private static string BuildDiagnostics(string? nativeDir, Dictionary<string, string?> libraryMap, int? avcodecVersion)
+    private static string BuildDiagnostics(string? nativeDir, Dictionary<string, string?> libraryMap, uint? avcodecVersion)
     {
         var sb = new StringBuilder();
         sb.AppendLine("FFmpeg diagnostics:");
