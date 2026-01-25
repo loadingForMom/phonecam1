@@ -41,6 +41,9 @@ public sealed class TrayAppContext : ApplicationContext
 
     private const string HotspotSsid = "PhoneCamHotspot";
     private const string HotspotPsk = "PhoneCamPass123";
+    private const int ControlPort = 39000;
+    private const int UdpPort = 39010;
+    private const string HotspotHost = "192.168.137.1";
 
     private static readonly string LogPath =
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -302,7 +305,8 @@ public sealed class TrayAppContext : ApplicationContext
         }
 
         var nonce = Guid.NewGuid().ToString("N")[..8];
-        var payload = $"ver=1;ssid={HotspotSsid};psk={HotspotPsk};tcp=39000;udp=39010;host=192.168.137.1;autostart=1;nonce={nonce}";
+        var host = GetBestLanIpv4() ?? HotspotHost;
+        var payload = $"ver=1;ssid={HotspotSsid};psk={HotspotPsk};tcp={ControlPort};udp={UdpPort};host={host};autostart=1;nonce={nonce}";
         await _ble.StartAsync(payload);
         _bleItem.Text = "Stop BLE Advertise";
     }
@@ -397,6 +401,8 @@ public sealed class TrayAppContext : ApplicationContext
         private readonly TimeSpan _deviceCooldown = TimeSpan.FromSeconds(30);
         private readonly TimeSpan _failureCooldown = TimeSpan.FromSeconds(10);
         private readonly TimeSpan _successCooldown = TimeSpan.FromSeconds(60);
+        private readonly TimeSpan _fallbackCooldown = TimeSpan.FromSeconds(60);
+        private DateTime _nextFallbackUtc = DateTime.MinValue;
 
         public BleProvisioningClient(Action<string> log, Action ensureServerRunning, bool isAdmin, Action<string> showFallback)
         {
@@ -455,11 +461,18 @@ public sealed class TrayAppContext : ApplicationContext
             _log($"BLE: phone detected addr={address}");
             _ensureServerRunning();
 
-            var hotspotStarted = StartHotspot(ssid, psk);
-            if (!hotspotStarted)
+            var hotspotResult = StartHotspot(ssid, psk);
+            if (hotspotResult != HotspotStartResult.Started)
             {
                 _log("Hotspot: failed to start");
-                MarkFailure(address);
+                if (hotspotResult == HotspotStartResult.Unsupported)
+                {
+                    MarkFallback(address);
+                }
+                else
+                {
+                    MarkFailure(address);
+                }
             }
 
             try
@@ -492,17 +505,18 @@ public sealed class TrayAppContext : ApplicationContext
                 var characteristic = charResult.Characteristics[0];
                 var writer = new DataWriter();
                 var nonce = Guid.NewGuid().ToString("N")[..8];
-                var payload = $"ver=1;ssid={ssid};psk={psk};tcp=39000;udp=39010;host=192.168.137.1;autostart=1;nonce={nonce}";
+                var host = hotspotResult == HotspotStartResult.Started ? HotspotHost : GetBestLanIpv4() ?? HotspotHost;
+                var payload = $"ver=1;ssid={ssid};psk={psk};tcp={ControlPort};udp={UdpPort};host={host};autostart=1;nonce={nonce}";
                 writer.WriteString(payload);
                 var status = await characteristic.WriteValueAsync(writer.DetachBuffer());
                 if (status == GattCommunicationStatus.Success)
                 {
                     _log("BLE: credentials sent");
-                    if (hotspotStarted)
+                    if (hotspotResult == HotspotStartResult.Started)
                     {
                         MarkSuccess(address);
                     }
-                    return hotspotStarted;
+                    return hotspotResult != HotspotStartResult.Failed;
                 }
                 else
                 {
@@ -519,7 +533,7 @@ public sealed class TrayAppContext : ApplicationContext
             }
         }
 
-        private bool StartHotspot(string ssid, string psk)
+        private HotspotStartResult StartHotspot(string ssid, string psk)
         {
             try
             {
@@ -527,10 +541,11 @@ public sealed class TrayAppContext : ApplicationContext
                 {
                     _log("Hotspot: not running as admin; cannot start hostednetwork.");
                     _showFallback("Run as Administrator or enable Mobile Hotspot manually.");
-                    return false;
+                    return HotspotStartResult.Failed;
                 }
 
-                if (!IsHostedNetworkSupported())
+                var support = IsHostedNetworkSupported();
+                if (support == HostedNetworkSupport.No)
                 {
                     _log("Hotspot: hosted network unsupported by driver.");
                     if (IsAppPackaged())
@@ -541,8 +556,13 @@ public sealed class TrayAppContext : ApplicationContext
                     {
                         _log("Hotspot: app not packaged; WinRT tethering API unavailable.");
                     }
-                    _showFallback("Hosted network unsupported. Enable Mobile Hotspot manually.");
-                    return false;
+                    ShowFallbackOnce("Hosted network unsupported. Enable Mobile Hotspot manually.");
+                    return HotspotStartResult.Unsupported;
+                }
+
+                if (support == HostedNetworkSupport.Unknown)
+                {
+                    _log("Hotspot: hosted network support unknown; attempting netsh.");
                 }
 
                 var config = RunNetsh($"wlan set hostednetwork mode=allow ssid=\"{ssid}\" key=\"{psk}\"");
@@ -550,7 +570,7 @@ public sealed class TrayAppContext : ApplicationContext
                 if (config.ExitCode != 0)
                 {
                     ReportHotspotFailure(config);
-                    return false;
+                    return HotspotStartResult.Failed;
                 }
 
                 var start = RunNetsh("wlan start hostednetwork");
@@ -558,16 +578,16 @@ public sealed class TrayAppContext : ApplicationContext
                 if (start.ExitCode != 0)
                 {
                     ReportHotspotFailure(start);
-                    return false;
+                    return HotspotStartResult.Failed;
                 }
 
                 _log($"Hotspot: started ssid={ssid}");
-                return true;
+                return HotspotStartResult.Started;
             }
             catch (Exception ex)
             {
                 _log("Hotspot: exception " + ex.Message);
-                return false;
+                return HotspotStartResult.Failed;
             }
         }
 
@@ -626,19 +646,30 @@ public sealed class TrayAppContext : ApplicationContext
             }
         }
 
-        private bool IsHostedNetworkSupported()
+        private HostedNetworkSupport IsHostedNetworkSupported()
         {
             var res = RunNetsh("wlan show drivers");
             LogNetshResult("Hotspot: netsh show drivers", res);
-            var text = $"{res.StdOut}\n{res.StdErr}".Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries);
-            foreach (var line in text)
+            var lines = $"{res.StdOut}\n{res.StdErr}".Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (var raw in lines)
             {
-                if (line.IndexOf("Hosted network supported", StringComparison.OrdinalIgnoreCase) >= 0)
+                var line = raw.Trim();
+                if (line.IndexOf("Hosted network supported", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    line.IndexOf("Поддержка размещенной сети", StringComparison.OrdinalIgnoreCase) >= 0)
                 {
-                    return line.IndexOf("Yes", StringComparison.OrdinalIgnoreCase) >= 0;
+                    if (line.IndexOf("Yes", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        line.IndexOf("Да", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        return HostedNetworkSupport.Yes;
+                    }
+                    if (line.IndexOf("No", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        line.IndexOf("Нет", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        return HostedNetworkSupport.No;
+                    }
                 }
             }
-            return true;
+            return HostedNetworkSupport.Unknown;
         }
 
         private static bool IsAppPackaged()
@@ -680,6 +711,25 @@ public sealed class TrayAppContext : ApplicationContext
                 _nextDeviceAttemptUtc[address] = DateTime.UtcNow + _deviceCooldown;
                 _nextGlobalAttemptUtc = DateTime.UtcNow + _successCooldown;
             }
+        }
+
+        private void MarkFallback(ulong address)
+        {
+            lock (_gate)
+            {
+                _nextDeviceAttemptUtc[address] = DateTime.UtcNow + _fallbackCooldown;
+                _nextGlobalAttemptUtc = DateTime.UtcNow + _fallbackCooldown;
+            }
+        }
+
+        private void ShowFallbackOnce(string message)
+        {
+            lock (_gate)
+            {
+                if (DateTime.UtcNow < _nextFallbackUtc) return;
+                _nextFallbackUtc = DateTime.UtcNow + _fallbackCooldown;
+            }
+            _showFallback(message);
         }
 
         private void StartWatcher()
@@ -738,5 +788,57 @@ public sealed class TrayAppContext : ApplicationContext
                 _t0 = Environment.TickCount64;
             }
         }
+    }
+
+    private enum HostedNetworkSupport
+    {
+        Yes,
+        No,
+        Unknown
+    }
+
+    private enum HotspotStartResult
+    {
+        Started,
+        Failed,
+        Unsupported
+    }
+
+    private static string? GetBestLanIpv4()
+    {
+        NetworkInterface? wifi = null;
+        NetworkInterface? ethernet = null;
+
+        foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+        {
+            if (nic.OperationalStatus != OperationalStatus.Up) continue;
+            if (nic.NetworkInterfaceType == NetworkInterfaceType.Loopback ||
+                nic.NetworkInterfaceType == NetworkInterfaceType.Tunnel)
+            {
+                continue;
+            }
+
+            if (nic.NetworkInterfaceType == NetworkInterfaceType.Wireless80211 && wifi == null)
+            {
+                wifi = nic;
+            }
+            else if (nic.NetworkInterfaceType == NetworkInterfaceType.Ethernet && ethernet == null)
+            {
+                ethernet = nic;
+            }
+        }
+
+        var chosen = wifi ?? ethernet;
+        if (chosen == null) return null;
+
+        foreach (var addr in chosen.GetIPProperties().UnicastAddresses)
+        {
+            if (addr.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+            {
+                return addr.Address.ToString();
+            }
+        }
+
+        return null;
     }
 }

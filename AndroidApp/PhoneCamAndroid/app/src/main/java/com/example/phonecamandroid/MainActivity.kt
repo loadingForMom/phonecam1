@@ -182,6 +182,7 @@ class MainActivity : AppCompatActivity() {
             action = H264StreamService.ACTION_START
             putExtra(H264StreamService.EXTRA_HOST, host)
             putExtra(H264StreamService.EXTRA_PORT, port)
+            putExtra(H264StreamService.EXTRA_TCP_PORT, 39000)
             putExtra(H264StreamService.EXTRA_WIDTH, 1280)
             putExtra(H264StreamService.EXTRA_HEIGHT, 720)
             putExtra(H264StreamService.EXTRA_FPS, 30)

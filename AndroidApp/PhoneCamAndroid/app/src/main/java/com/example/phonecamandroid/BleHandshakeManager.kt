@@ -17,6 +17,7 @@ import android.bluetooth.le.BluetoothLeAdvertiser
 import android.content.Context
 import android.content.Intent
 import android.net.ConnectivityManager
+import android.net.LinkAddress
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
@@ -26,6 +27,8 @@ import android.net.wifi.WifiNetworkSpecifier
 import android.os.Build
 import android.os.ParcelUuid
 import java.nio.charset.StandardCharsets
+import java.net.Inet4Address
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.UUID
@@ -261,6 +264,7 @@ class BleHandshakeManager(private val context: Context) {
             action = H264StreamService.ACTION_START
             putExtra(H264StreamService.EXTRA_HOST, payload.host)
             putExtra(H264StreamService.EXTRA_PORT, payload.udpPort)
+            putExtra(H264StreamService.EXTRA_TCP_PORT, payload.tcpPort)
             putExtra(H264StreamService.EXTRA_WIDTH, 1280)
             putExtra(H264StreamService.EXTRA_HEIGHT, 720)
             putExtra(H264StreamService.EXTRA_FPS, 30)
@@ -278,10 +282,15 @@ class BleHandshakeManager(private val context: Context) {
         val active = cm.activeNetwork ?: return false
         val caps = cm.getNetworkCapabilities(active) ?: return false
         if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return false
+        val lp = cm.getLinkProperties(active) ?: return false
+        val hostAddr = try { InetAddress.getByName(host) } catch (_: Throwable) { null }
 
+        if (!hasIpv4(lp)) return false
+        val onSubnet = isHostOnSameSubnet(hostAddr, lp)
+        val hasRoute = hasRouteToHost(hostAddr, lp)
         val probe = quickProbe(host, port, timeoutMs = 1500)
-        StreamState.log("Wi-Fi: probe $host:$port result=$probe")
-        return probe != ProbeResult.Timeout
+        StreamState.log("Wi-Fi: suitability wifi ipv4=${hasIpv4(lp)} subnet=$onSubnet route=$hasRoute probe=$probe")
+        return onSubnet || hasRoute
     }
 
     private enum class ProbeResult { Success, Refused, Timeout, Error }
@@ -299,6 +308,45 @@ class BleHandshakeManager(private val context: Context) {
         } catch (_: Throwable) {
             ProbeResult.Error
         }
+    }
+
+    private fun hasIpv4(lp: android.net.LinkProperties): Boolean {
+        return lp.linkAddresses.any { it.address is Inet4Address }
+    }
+
+    private fun isHostOnSameSubnet(hostAddr: InetAddress?, lp: android.net.LinkProperties): Boolean {
+        val host4 = hostAddr as? Inet4Address ?: return false
+        val hostInt = ipv4ToInt(host4)
+
+        for (la: LinkAddress in lp.linkAddresses) {
+            val addr4 = la.address as? Inet4Address ?: continue
+            val prefix = la.prefixLength
+            if (prefix <= 0 || prefix > 32) continue
+            val mask = prefixToMask(prefix)
+            val netA = ipv4ToInt(addr4) and mask
+            val netH = hostInt and mask
+            if (netA == netH) return true
+        }
+        return false
+    }
+
+    private fun hasRouteToHost(hostAddr: InetAddress?, lp: android.net.LinkProperties): Boolean {
+        if (hostAddr == null) return false
+        return lp.routes.any { route ->
+            route.destination?.contains(hostAddr) == true
+        }
+    }
+
+    private fun ipv4ToInt(a: Inet4Address): Int {
+        val b = a.address
+        return ((b[0].toInt() and 0xFF) shl 24) or
+            ((b[1].toInt() and 0xFF) shl 16) or
+            ((b[2].toInt() and 0xFF) shl 8) or
+            (b[3].toInt() and 0xFF)
+    }
+
+    private fun prefixToMask(prefix: Int): Int {
+        return if (prefix == 0) 0 else (-1 shl (32 - prefix))
     }
 
     private data class HandshakePayload(
