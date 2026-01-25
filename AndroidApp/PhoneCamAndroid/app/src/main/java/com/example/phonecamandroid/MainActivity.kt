@@ -42,6 +42,7 @@ class MainActivity : AppCompatActivity() {
             val ok = result.values.all { it }
             log(if (ok) "Permissions OK" else "Permissions denied: $result")
             btnStart.isEnabled = ok
+            if (ok) startBleHandshake()
         }
 
     private val serviceConnection = object : ServiceConnection {
@@ -92,7 +93,7 @@ class MainActivity : AppCompatActivity() {
         btnStart.setOnClickListener { startStreaming() }
         btnStop.setOnClickListener { stopStreaming() }
         btnLogs.setOnClickListener { startActivity(Intent(this, LogsActivity::class.java)) }
-        btnBle.setOnClickListener { toggleBleScan() }
+        btnBle.setOnClickListener { toggleBleHandshake() }
 
         ensurePermissions()
 
@@ -131,6 +132,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onDestroy() {
+        super.onDestroy()
+        bleManager.stopHandshake()
+    }
+
     private fun ensurePermissions() {
         val need = mutableListOf(
             Manifest.permission.CAMERA,
@@ -140,10 +146,14 @@ class MainActivity : AppCompatActivity() {
         if (Build.VERSION.SDK_INT >= 33) {
             need.add(Manifest.permission.NEARBY_WIFI_DEVICES)
             need.add(Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            need.add(Manifest.permission.ACCESS_FINE_LOCATION)
         }
+
         if (Build.VERSION.SDK_INT >= 31) {
             need.add(Manifest.permission.BLUETOOTH_SCAN)
             need.add(Manifest.permission.BLUETOOTH_CONNECT)
+            need.add(Manifest.permission.BLUETOOTH_ADVERTISE)
         }
 
         val missing = need.filter { perm ->
@@ -156,6 +166,7 @@ class MainActivity : AppCompatActivity() {
         } else {
             log("Permissions OK")
             btnStart.isEnabled = true
+            startBleHandshake()
         }
     }
 
@@ -195,13 +206,19 @@ class MainActivity : AppCompatActivity() {
         StreamState.log(s)
     }
 
-    private fun toggleBleScan() {
-        val serviceUuid = "0000feed-0000-1000-8000-00805f9b34fb"
-        if (bleManager.isScanning()) {
-            bleManager.stopScan()
-            btnBle.text = "BLE Scan"
+    private fun toggleBleHandshake() {
+        if (bleManager.isAdvertising()) {
+            bleManager.stopHandshake()
+            btnBle.text = "BLE Advertise"
         } else {
-            bleManager.startScan(serviceUuid)
+            bleManager.startHandshake()
+            btnBle.text = "Stop BLE"
+        }
+    }
+
+    private fun startBleHandshake() {
+        if (!bleManager.isAdvertising()) {
+            bleManager.startHandshake()
             btnBle.text = "Stop BLE"
         }
     }
