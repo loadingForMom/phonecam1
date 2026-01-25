@@ -377,8 +377,8 @@ public sealed class TrayAppContext : ApplicationContext
             var props = IPGlobalProperties.GetIPGlobalProperties();
             var tcp = props.GetActiveTcpListeners();
             var udp = props.GetActiveUdpListeners();
-            Log($"NET: TCP listeners={string.Join(", ", tcp)}");
-            Log($"NET: UDP listeners={string.Join(", ", udp)}");
+            Log($"NET: TCP listeners={string.Join(", ", tcp.Select(ep => ep.ToString()))}");
+            Log($"NET: UDP listeners={string.Join(", ", udp.Select(ep => ep.ToString()))}");
         }
         catch (Exception ex)
         {

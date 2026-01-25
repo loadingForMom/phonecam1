@@ -26,11 +26,11 @@ import android.net.wifi.WifiManager
 import android.net.wifi.WifiNetworkSpecifier
 import android.os.Build
 import android.os.ParcelUuid
-import java.nio.charset.StandardCharsets
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.nio.charset.StandardCharsets
 import java.util.UUID
 
 class BleHandshakeManager(private val context: Context) {
@@ -105,6 +105,16 @@ class BleHandshakeManager(private val context: Context) {
         } catch (_: Throwable) {
         }
 
+        // Безопасно снимаем коллбек сети
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        networkCallback?.let { cb ->
+            try {
+                cm.unregisterNetworkCallback(cb)
+            } catch (_: Throwable) {
+            }
+        }
+        networkCallback = null
+
         try {
             gattServer?.close()
         } catch (_: Throwable) {
@@ -153,9 +163,17 @@ class BleHandshakeManager(private val context: Context) {
 
             StreamState.log(
                 "BLE: parsed ssid=${parsed.ssid} host=${parsed.host} tcp=${parsed.tcpPort} udp=${parsed.udpPort} " +
-                    "autostart=${parsed.autostart} nonce=${parsed.nonce ?: "-"}"
+                        "autostart=${parsed.autostart} nonce=${parsed.nonce ?: "-"}"
             )
-            Thread { connectToWifi(parsed) }.start()
+
+            Thread {
+                try {
+                    connectToWifi(parsed)
+                } catch (t: Throwable) {
+                    // Чтобы никакой фоновой поток не убивал процесс
+                    StreamState.log("BLE: connectToWifi crashed: ${t.javaClass.simpleName}: ${t.message}")
+                }
+            }.start()
         }
     }
 
@@ -166,15 +184,24 @@ class BleHandshakeManager(private val context: Context) {
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
 
         if (!wifiManager.isWifiEnabled) {
-            val enabled = wifiManager.setWifiEnabled(true)
+            val enabled = try {
+                wifiManager.setWifiEnabled(true)
+            } catch (t: Throwable) {
+                StreamState.log("Wi-Fi: setWifiEnabled failed: ${t.javaClass.simpleName}: ${t.message}")
+                false
+            }
             StreamState.log("Wi-Fi: enable requested result=$enabled")
         }
 
+        // Если уже на подходящем Wi-Fi — биндимся и автозапускаем без requestNetwork
         if (payload.autostart && isWifiAlreadySuitable(cm, payload.host, payload.tcpPort)) {
-            StreamState.log("Wi-Fi: already connected; attempting autostart")
+            StreamState.log("Wi-Fi: already suitable; ensuring bind + autostart")
+            bindToActiveWifiIfPossible(cm)
             startStreamingIfNeeded(payload)
+            return
         }
 
+        // Legacy (до Android 10): можно через WifiConfiguration
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             val config = WifiConfiguration().apply {
                 SSID = "\"$ssid\""
@@ -199,7 +226,15 @@ class BleHandshakeManager(private val context: Context) {
             return
         }
 
-        networkCallback?.let { cm.unregisterNetworkCallback(it) }
+        // Android 10+ : WifiNetworkSpecifier + requestNetwork
+        // Но requestNetwork может требовать прав/политик -> ловим SecurityException и НЕ падаем
+        networkCallback?.let { cb ->
+            try {
+                cm.unregisterNetworkCallback(cb)
+            } catch (_: Throwable) {
+            }
+        }
+        networkCallback = null
 
         val specifier = WifiNetworkSpecifier.Builder()
             .setSsid(ssid)
@@ -213,21 +248,65 @@ class BleHandshakeManager(private val context: Context) {
 
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                cm.bindProcessToNetwork(network)
-                StreamState.log("Wi-Fi: connected to $ssid")
+                try {
+                    cm.bindProcessToNetwork(network)
+                    StreamState.log("Wi-Fi: connected/bound to $ssid")
+                } catch (t: Throwable) {
+                    StreamState.log("Wi-Fi: bindProcessToNetwork failed: ${t.javaClass.simpleName}: ${t.message}")
+                }
+
                 if (payload.autostart) {
                     startStreamingIfNeeded(payload)
                 }
             }
 
             override fun onUnavailable() {
-                StreamState.log("Wi-Fi: failed to connect to $ssid")
+                StreamState.log("Wi-Fi: requestNetwork unavailable for $ssid (no UI approval / policy)")
+                // fallback: пробуем работать с текущим Wi-Fi если он уже есть
+                if (payload.autostart) {
+                    bindToActiveWifiIfPossible(cm)
+                    if (isWifiAlreadySuitable(cm, payload.host, payload.tcpPort)) {
+                        startStreamingIfNeeded(payload)
+                    }
+                }
             }
         }
         networkCallback = callback
 
-        cm.requestNetwork(request, callback)
-        StreamState.log("Wi-Fi: request sent for $ssid")
+        try {
+            cm.requestNetwork(request, callback)
+            StreamState.log("Wi-Fi: request sent for $ssid")
+        } catch (se: SecurityException) {
+            // ✅ вот тут и был твой краш
+            StreamState.log("Wi-Fi: requestNetwork SecurityException: ${se.message}")
+            // fallback: не умираем, а пытаемся работать с текущим Wi-Fi
+            if (payload.autostart) {
+                bindToActiveWifiIfPossible(cm)
+                if (isWifiAlreadySuitable(cm, payload.host, payload.tcpPort)) {
+                    startStreamingIfNeeded(payload)
+                } else {
+                    StreamState.log("Wi-Fi: fallback skipped (not suitable yet)")
+                }
+            }
+        } catch (t: Throwable) {
+            StreamState.log("Wi-Fi: requestNetwork failed: ${t.javaClass.simpleName}: ${t.message}")
+        }
+    }
+
+    /**
+     * Мягкий bind к текущему активному Wi-Fi без requestNetwork.
+     * Это безопасно и не требует WRITE_SETTINGS.
+     */
+    private fun bindToActiveWifiIfPossible(cm: ConnectivityManager) {
+        try {
+            val active = cm.activeNetwork ?: return
+            val caps = cm.getNetworkCapabilities(active) ?: return
+            if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return
+            cm.bindProcessToNetwork(active)
+            StreamState.log("Wi-Fi: bound to active Wi-Fi")
+        } catch (t: Throwable) {
+            StreamState.log("Wi-Fi: bindToActiveWifi failed: ${t.javaClass.simpleName}: ${t.message}")
+        }
     }
 
     private fun scheduleLegacyAutostart(payload: HandshakePayload) {
@@ -235,9 +314,10 @@ class BleHandshakeManager(private val context: Context) {
         Thread {
             try {
                 Thread.sleep(1200)
-            } catch (_: Throwable) {}
+            } catch (_: Throwable) { }
             val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
             if (isWifiAlreadySuitable(cm, payload.host, payload.tcpPort)) {
+                bindToActiveWifiIfPossible(cm)
                 startStreamingIfNeeded(payload)
             } else {
                 StreamState.log("Wi-Fi: legacy autostart skipped (not yet connected)")
@@ -270,19 +350,24 @@ class BleHandshakeManager(private val context: Context) {
             putExtra(H264StreamService.EXTRA_FPS, 30)
             putExtra(H264StreamService.EXTRA_BITRATE, 2_000_000)
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            context.startForegroundService(intent)
-        } else {
-            context.startService(intent)
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
+            StreamState.log("Autostart: requested streaming → ${payload.host}:${payload.udpPort}")
+        } catch (t: Throwable) {
+            StreamState.log("Autostart: start service failed: ${t.javaClass.simpleName}: ${t.message}")
         }
-        StreamState.log("Autostart: requested streaming → ${payload.host}:${payload.udpPort}")
     }
 
     private fun isWifiAlreadySuitable(cm: ConnectivityManager, host: String, port: Int): Boolean {
         val active = cm.activeNetwork ?: return false
-        val caps = cm.getNetworkCapabilities(active) ?: return false
+        val caps = try { cm.getNetworkCapabilities(active) } catch (_: Throwable) { null } ?: return false
         if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return false
-        val lp = cm.getLinkProperties(active) ?: return false
+        val lp = try { cm.getLinkProperties(active) } catch (_: Throwable) { null } ?: return false
         val hostAddr = try { InetAddress.getByName(host) } catch (_: Throwable) { null }
 
         if (!hasIpv4(lp)) return false
@@ -340,9 +425,9 @@ class BleHandshakeManager(private val context: Context) {
     private fun ipv4ToInt(a: Inet4Address): Int {
         val b = a.address
         return ((b[0].toInt() and 0xFF) shl 24) or
-            ((b[1].toInt() and 0xFF) shl 16) or
-            ((b[2].toInt() and 0xFF) shl 8) or
-            (b[3].toInt() and 0xFF)
+                ((b[1].toInt() and 0xFF) shl 16) or
+                ((b[2].toInt() and 0xFF) shl 8) or
+                (b[3].toInt() and 0xFF)
     }
 
     private fun prefixToMask(prefix: Int): Int {
