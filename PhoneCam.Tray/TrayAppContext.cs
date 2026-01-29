@@ -21,6 +21,7 @@ namespace PhoneCam.Tray;
 public sealed class TrayAppContext : ApplicationContext
 {
     private PhoneCamServer? _server;
+    private VirtualCamFrameHub? _frameHub;
 
     private readonly NotifyIcon _tray;
     private readonly ToolStripMenuItem _startItem;
@@ -116,6 +117,9 @@ public sealed class TrayAppContext : ApplicationContext
         _server.OnMediaStats += snap =>
             Log($"UDP: {snap.PacketsPerSec:F0} pkt/s, {(snap.BytesPerSec * 8 / 1000.0):F0} kbps, loss={snap.LossPerSec:F1}/s");
 
+        _frameHub = new VirtualCamFrameHub(LogSafe);
+        _frameHub.Start();
+
         _server.Start();
         LogServerDiagnostics();
 
@@ -127,6 +131,20 @@ public sealed class TrayAppContext : ApplicationContext
         Log("Stop clicked");
 
         StopDecodeLoop();
+
+        try
+        {
+            _frameHub?.Stop();
+            _frameHub?.Dispose();
+        }
+        catch (Exception ex)
+        {
+            Log("Frame hub stop failed: " + ex);
+        }
+        finally
+        {
+            _frameHub = null;
+        }
 
         if (_server is not null)
         {
@@ -180,6 +198,17 @@ public sealed class TrayAppContext : ApplicationContext
                     foreach (var bmp in decoder.DecodeToBitmaps(au))
                     {
                         fps.OnFrame();
+
+                        // Always publish the frame to the virtual camera hub
+                        try
+                        {
+                            _frameHub?.UpdateFromBitmap(bmp);
+                        }
+                        catch (Exception ex)
+                        {
+                            Log("Frame hub update failed: " + ex.Message);
+                        }
+
                         var form = _videoForm;
 
                         if (form is not null && !form.IsDisposed)
@@ -227,6 +256,20 @@ public sealed class TrayAppContext : ApplicationContext
 
         StopDecodeLoop();
         _ble?.Stop();
+
+        try
+        {
+            _frameHub?.Stop();
+            _frameHub?.Dispose();
+        }
+        catch (Exception ex)
+        {
+            Log("Frame hub stop failed: " + ex);
+        }
+        finally
+        {
+            _frameHub = null;
+        }
 
         if (_server is not null)
         {
