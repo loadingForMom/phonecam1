@@ -56,7 +56,9 @@ public sealed class VirtualCamFrameHub : IDisposable
     private Task? _statsTask;
     private TcpListener? _tcp;
 
-    private volatile FrameBuffer? _latest;
+    // Use explicit Volatile.Read/Interlocked.Exchange instead of the 'volatile' keyword.
+    // This avoids CS0420 warnings when passing the field by ref.
+    private FrameBuffer? _latest;
 
     // Counters
     private long _framesCaptured;
@@ -421,6 +423,38 @@ public sealed class VirtualCamFrameHub : IDisposable
         }
     }
 
+    /// <summary>
+    /// Safely acquires a reference-counted view of the latest frame buffer.
+    /// The caller MUST dispose the lease when finished.
+    /// </summary>
+    public FrameLease? AcquireLatestFrameLease()
+    {
+        var fb = AcquireLatestFrame();
+        return fb is null ? null : new FrameLease(fb);
+    }
+
+    public sealed class FrameLease : IDisposable
+    {
+        private FrameBuffer? _fb;
+
+		internal FrameLease(FrameBuffer fb)
+        {
+            _fb = fb;
+        }
+
+        public int Width => _fb?.Width ?? 0;
+        public int Height => _fb?.Height ?? 0;
+        public int Length => _fb?.Length ?? 0;
+        public long FrameId => _fb?.FrameId ?? 0;
+        public ReadOnlyMemory<byte> Data => _fb is null ? ReadOnlyMemory<byte>.Empty : new ReadOnlyMemory<byte>(_fb.Data, 0, _fb.Length);
+
+        public void Dispose()
+        {
+            var fb = Interlocked.Exchange(ref _fb, null);
+            fb?.Release();
+        }
+    }
+
     private async Task StatsLoopAsync(CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();
@@ -489,7 +523,7 @@ public sealed class VirtualCamFrameHub : IDisposable
         return readTotal;
     }
 
-    private sealed class FrameBuffer
+    internal sealed class FrameBuffer
     {
         public readonly byte[] Data;
         public readonly int Length;

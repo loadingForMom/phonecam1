@@ -1,8 +1,6 @@
-﻿using System;
+﻿﻿using System;
 using System.Collections.Generic;
-using System.Linq;
 using System.Net.Sockets;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using KinectCam;
@@ -13,8 +11,9 @@ namespace Tedd.VirtualNetworkCam
     {
         private readonly int _port;
         private readonly VirtualCamFilter _camFilter;
-        private CancellationTokenSource _cancellationTokenSource;
-        private List<NetworkCamServerClient> _clients = new List<NetworkCamServerClient>();
+        private readonly CancellationTokenSource _cancellationTokenSource;
+        private readonly List<NetworkCamServerClient> _clients = new List<NetworkCamServerClient>();
+
         public NetworkCamServer(int port, VirtualCamFilter camFilter)
         {
             _port = port;
@@ -26,20 +25,20 @@ namespace Tedd.VirtualNetworkCam
         {
             Logger.Info("Is64BitProcess: " + Environment.Is64BitProcess);
             Logger.Info("Listening to TCP port " + _port);
-            TcpListener listener = new TcpListener(_port);
+
+            var listener = new TcpListener(_port);
             listener.Start();
+
             _cancellationTokenSource.Token.Register(listener.Stop);
+
             while (!_cancellationTokenSource.Token.IsCancellationRequested)
             {
                 try
                 {
-                    var client = await listener.AcceptTcpClientAsync();
-                    Logger.Info("Accepting new client: " + client.Client.RemoteEndPoint.ToString());
-                    var clientTask =
-                            HandleClient(client, _cancellationTokenSource.Token);
-                                //.ContinueWith((antecedent) => client.Dispose())
-                                //.ContinueWith((antecedent) => Console.WriteLine("Client disposed."))
-                                ;
+                    var client = await listener.AcceptTcpClientAsync().ConfigureAwait(false);
+                    Logger.Info("Accepting new client: " + client.Client.RemoteEndPoint);
+
+                    _ = HandleClient(client, _cancellationTokenSource.Token);
                 }
                 catch (ObjectDisposedException) when (_cancellationTokenSource.Token.IsCancellationRequested)
                 {
@@ -47,17 +46,18 @@ namespace Tedd.VirtualNetworkCam
                 }
                 catch (Exception ex)
                 {
-                    Logger.Error(ex, $"Error handling client.");
+                    Logger.Error(ex, "Error handling client.");
                 }
             }
         }
 
-        public async Task StopAsync()
+        public Task StopAsync()
         {
             _cancellationTokenSource.Cancel();
+            return Task.CompletedTask;
         }
 
-        private async Task HandleClient(TcpClient client, CancellationToken token)
+        private Task HandleClient(TcpClient client, CancellationToken token)
         {
             var c = new NetworkCamServerClient(client, token, _camFilter);
 
@@ -65,15 +65,15 @@ namespace Tedd.VirtualNetworkCam
             lock (_clients)
                 _clients.Add(c);
 
-
             // Remove reference
-            c.Closed += (cc) =>
+            c.Closed += cc =>
             {
                 lock (_clients)
                     _clients.Remove(cc);
             };
 
+            return Task.CompletedTask;
         }
-
     }
 }
+

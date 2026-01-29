@@ -7,6 +7,7 @@ import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.IBinder
 import android.view.Surface
 import android.view.TextureView
 import android.widget.Button
@@ -14,7 +15,6 @@ import android.widget.EditText
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.content.ContextCompat.startForegroundService
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.flow.collectLatest
@@ -32,7 +32,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var previewView: TextureView
 
     private var previewSurface: Surface? = null
-    private var service: H264StreamService? = null
+    private var streamService: H264StreamService? = null
     private var bound = false
 
     private val bleManager by lazy { BleHandshakeManager(this) }
@@ -46,16 +46,16 @@ class MainActivity : AppCompatActivity() {
         }
 
     private val serviceConnection = object : ServiceConnection {
-        override fun onServiceConnected(name: ComponentName?, binder: android.os.IBinder?) {
+        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
             val local = binder as? H264StreamService.LocalBinder
-            service = local?.service
+            streamService = local?.service
             bound = true
-            service?.setPreviewSurface(previewSurface)
+            streamService?.setPreviewSurface(previewSurface)
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
             bound = false
-            service = null
+            streamService = null
         }
     }
 
@@ -75,7 +75,7 @@ class MainActivity : AppCompatActivity() {
         previewView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
             override fun onSurfaceTextureAvailable(surfaceTexture: android.graphics.SurfaceTexture, width: Int, height: Int) {
                 previewSurface = Surface(surfaceTexture)
-                service?.setPreviewSurface(previewSurface)
+                streamService?.setPreviewSurface(previewSurface)
             }
 
             override fun onSurfaceTextureSizeChanged(surfaceTexture: android.graphics.SurfaceTexture, width: Int, height: Int) {}
@@ -83,7 +83,7 @@ class MainActivity : AppCompatActivity() {
             override fun onSurfaceTextureDestroyed(surfaceTexture: android.graphics.SurfaceTexture): Boolean {
                 previewSurface?.release()
                 previewSurface = null
-                service?.setPreviewSurface(null)
+                streamService?.setPreviewSurface(null)
                 return true
             }
 
@@ -101,7 +101,7 @@ class MainActivity : AppCompatActivity() {
             StreamState.stats.collectLatest { stats ->
                 val idleStates = setOf("Idle", "Stopped", "Failed", "Control failed", "Stream init failed")
                 val baseStatus = "State=${stats.connectionState} FPS=${"%.1f".format(stats.fps)} " +
-                    "Bitrate=${"%.0f".format(stats.bitrateKbps)} kbps"
+                        "Bitrate=${"%.0f".format(stats.bitrateKbps)} kbps"
                 txtStatus.text = if (stats.connectionState in idleStates) {
                     "$baseStatus (Preview starts when streaming)"
                 } else {
@@ -183,12 +183,14 @@ class MainActivity : AppCompatActivity() {
             putExtra(H264StreamService.EXTRA_HOST, host)
             putExtra(H264StreamService.EXTRA_PORT, port)
             putExtra(H264StreamService.EXTRA_TCP_PORT, 39000)
-            putExtra(H264StreamService.EXTRA_WIDTH, 1280)
+            // 4:3 "full sensor" look (most phones are native 4:3) while keeping ~720p height.
+            // 960x720 is 4:3 and encoder-friendly (multiples of 16).
+            putExtra(H264StreamService.EXTRA_WIDTH, 960)
             putExtra(H264StreamService.EXTRA_HEIGHT, 720)
             putExtra(H264StreamService.EXTRA_FPS, 30)
             putExtra(H264StreamService.EXTRA_BITRATE, 2_000_000)
         }
-        startForegroundService(this, i)
+        ContextCompat.startForegroundService(this, i)
     }
 
     private fun stopStreaming() {

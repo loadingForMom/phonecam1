@@ -2,16 +2,17 @@
 
 import android.annotation.SuppressLint
 import android.content.Context
-import android.graphics.ImageFormat
 import android.hardware.camera2.*
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
 import android.util.Range
 import android.view.Surface
+import androidx.core.content.ContextCompat
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetSocketAddress
@@ -393,9 +394,9 @@ class UdpH264Streamer(private val ctx: Context) {
             StreamStats(
                 connectionState = connectionState,
                 remote = remoteStr,
-                fps = fps ?: prev.fps,
-                bitrateKbps = bitrateKbps ?: prev.bitrateKbps,
-                droppedFrames = droppedFrames ?: prev.droppedFrames,
+                fps = fps?.toFloat() ?: prev.fps,
+                bitrateKbps = bitrateKbps?.toFloat() ?: prev.bitrateKbps,
+                droppedFrames = droppedFrames?.toInt() ?: prev.droppedFrames,
                 queueDepth = queueDepth ?: prev.queueDepth,
                 localIp = localIp ?: prev.localIp
             )
@@ -502,6 +503,7 @@ class UdpH264Streamer(private val ctx: Context) {
             return cm.cameraIdList.first()
         }
 
+        @Suppress("DEPRECATION")
         private fun createSession(input: Surface, width: Int, height: Int, fps: Int) {
             val dev = device ?: return
             val h = handler ?: return
@@ -510,27 +512,52 @@ class UdpH264Streamer(private val ctx: Context) {
             surfaces.add(input)
             previewSurface?.let { surfaces.add(it) }
 
-            dev.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
-                override fun onConfigured(s: CameraCaptureSession) {
-                    session = s
-                    val req = dev.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
-                        addTarget(input)
-                        previewSurface?.let { addTarget(it) }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val outputConfigs = surfaces.map { android.hardware.camera2.params.OutputConfiguration(it) }
+                dev.createCaptureSessionByOutputConfigurations(outputConfigs, object : CameraCaptureSession.StateCallback() {
+                    override fun onConfigured(s: CameraCaptureSession) {
+                        session = s
+                        val req = dev.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                            addTarget(input)
+                            previewSurface?.let { addTarget(it) }
 
-                        // FPS range (best effort)
-                        set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(fps, fps))
-                        set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-                        set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                            // FPS range (best effort)
+                            set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(fps, fps))
+                            set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                            set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                        }
+
+                        s.setRepeatingRequest(req.build(), null, h)
+                        onLog?.invoke("Capture session running")
                     }
 
-                    s.setRepeatingRequest(req.build(), null, h)
-                    onLog?.invoke("Capture session running")
-                }
+                    override fun onConfigureFailed(s: CameraCaptureSession) {
+                        onLog?.invoke("Capture session configure failed")
+                    }
+                }, h)
+            } else {
+                dev.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
+                    override fun onConfigured(s: CameraCaptureSession) {
+                        session = s
+                        val req = dev.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                            addTarget(input)
+                            previewSurface?.let { addTarget(it) }
 
-                override fun onConfigureFailed(s: CameraCaptureSession) {
-                    onLog?.invoke("Capture session configure failed")
-                }
-            }, h)
+                            // FPS range (best effort)
+                            set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(fps, fps))
+                            set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                            set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                        }
+
+                        s.setRepeatingRequest(req.build(), null, h)
+                        onLog?.invoke("Capture session running")
+                    }
+
+                    override fun onConfigureFailed(s: CameraCaptureSession) {
+                        onLog?.invoke("Capture session configure failed")
+                    }
+                }, h)
+            }
         }
     }
 }

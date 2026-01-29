@@ -1,11 +1,8 @@
 ﻿using System;
 using System.Buffers;
 using System.Buffers.Binary;
-using System.Drawing;
-using System.Drawing.Imaging;
 using System.IO;
 using System.IO.Pipes;
-using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -155,76 +152,14 @@ namespace PhoneCam.Tray
 
         private async Task WriteLatestFrameAsync(Stream stream, CancellationToken ct)
         {
-            // IMPORTANT: We avoid per-frame heap allocations:
-            // - Header is stackalloc'd
-            // - Pixel buffer is rented from ArrayPool
-            Bitmap? bmp = null;
-            try
-            {
-                // Expected API: VirtualCamFrameHub provides latest Bitmap (BGR24).
-                // If your hub method/property name differs, update ONLY this line.
-                bmp = _frameHub.GetLatestFrame();
-            }
-            catch
-            {
-                bmp = null;
-            }
-
-            if (bmp == null)
+            // VirtualCamFrameHub already stores a tightly-packed BGR24 buffer.
+            // Acquire it via a reference-counted lease to avoid extra allocations/copies.
+            var lease = _frameHub.AcquireLatestFrameLease();
+            if (lease is null || lease.Length <= 0)
             {
                 Span<byte> header = stackalloc byte[16];
                 header.Clear();
-                await stream.WriteAsync(header.ToArray(), 0, header.Length, ct).ConfigureAwait(false);
-                await stream.FlushAsync(ct).ConfigureAwait(false);
-                return;
-            }
 
-            BitmapData? data = null;
-            byte[]? rented = null;
-            int width = 0, height = 0, stride = 0, length = 0;
-
-            try
-            {
-                width = bmp.Width;
-                height = bmp.Height;
-
-                // Ensure BGR24
-                data = bmp.LockBits(
-                    new Rectangle(0, 0, width, height),
-                    ImageLockMode.ReadOnly,
-                    PixelFormat.Format24bppRgb);
-
-                stride = data.Stride;
-                length = checked(Math.Abs(stride) * height);
-
-                rented = ArrayPool<byte>.Shared.Rent(length);
-                IntPtr src = data.Scan0;
-
-                // Copy row-by-row in case of negative stride
-                if (stride > 0)
-                {
-                    Marshal.Copy(src, rented, 0, length);
-                }
-                else
-                {
-                    // bottom-up
-                    int absStride = -stride;
-                    for (int y = 0; y < height; y++)
-                    {
-                        IntPtr rowPtr = IntPtr.Add(src, y * absStride);
-                        Marshal.Copy(rowPtr, rented, y * absStride, absStride);
-                    }
-                    stride = absStride;
-                    length = checked(stride * height);
-                }
-
-                Span<byte> header = stackalloc byte[16];
-                BinaryPrimitives.WriteInt32LittleEndian(header.Slice(0, 4), width);
-                BinaryPrimitives.WriteInt32LittleEndian(header.Slice(4, 4), height);
-                BinaryPrimitives.WriteInt32LittleEndian(header.Slice(8, 4), stride);
-                BinaryPrimitives.WriteInt32LittleEndian(header.Slice(12, 4), length);
-
-                // Write header (stack) without allocating: use small pooled buffer
                 byte[] hdr = ArrayPool<byte>.Shared.Rent(16);
                 try
                 {
@@ -236,19 +171,37 @@ namespace PhoneCam.Tray
                     ArrayPool<byte>.Shared.Return(hdr);
                 }
 
-                await stream.WriteAsync(rented, 0, length, ct).ConfigureAwait(false);
                 await stream.FlushAsync(ct).ConfigureAwait(false);
+                return;
             }
-            finally
+
+            using (lease)
             {
-                if (data != null)
+                int width = lease.Width;
+                int height = lease.Height;
+                int stride = checked(width * 3); // BGR24 tightly-packed
+                int length = lease.Length;
+
+                Span<byte> header = stackalloc byte[16];
+                BinaryPrimitives.WriteInt32LittleEndian(header.Slice(0, 4), width);
+                BinaryPrimitives.WriteInt32LittleEndian(header.Slice(4, 4), height);
+                BinaryPrimitives.WriteInt32LittleEndian(header.Slice(8, 4), stride);
+                BinaryPrimitives.WriteInt32LittleEndian(header.Slice(12, 4), length);
+
+                byte[] hdr = ArrayPool<byte>.Shared.Rent(16);
+                try
                 {
-                    try { bmp.UnlockBits(data); } catch { /* ignore */ }
+                    header.CopyTo(hdr);
+                    await stream.WriteAsync(hdr, 0, 16, ct).ConfigureAwait(false);
                 }
-                if (rented != null)
+                finally
                 {
-                    ArrayPool<byte>.Shared.Return(rented);
+                    ArrayPool<byte>.Shared.Return(hdr);
                 }
+
+                // Write payload
+                await stream.WriteAsync(lease.Data, ct).ConfigureAwait(false);
+                await stream.FlushAsync(ct).ConfigureAwait(false);
             }
         }
 

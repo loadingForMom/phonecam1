@@ -183,9 +183,15 @@ class BleHandshakeManager(private val context: Context) {
         val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
 
+        @Suppress("DEPRECATION")
         if (!wifiManager.isWifiEnabled) {
             val enabled = try {
-                wifiManager.setWifiEnabled(true)
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                    wifiManager.isWifiEnabled = true
+                    true
+                } else {
+                    false // Need to use settings panel
+                }
             } catch (t: Throwable) {
                 StreamState.log("Wi-Fi: setWifiEnabled failed: ${t.javaClass.simpleName}: ${t.message}")
                 false
@@ -202,10 +208,11 @@ class BleHandshakeManager(private val context: Context) {
         }
 
         // Legacy (до Android 10): можно через WifiConfiguration
+        @Suppress("DEPRECATION")
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             val config = WifiConfiguration().apply {
-                SSID = "\"$ssid\""
-                preSharedKey = "\"$password\""
+                this.SSID = "\"$ssid\""
+                this.preSharedKey = "\"$password\""
             }
 
             wifiManager.configuredNetworks?.firstOrNull { it.SSID == "\"$ssid\"" }?.let {
@@ -345,7 +352,9 @@ class BleHandshakeManager(private val context: Context) {
             putExtra(H264StreamService.EXTRA_HOST, payload.host)
             putExtra(H264StreamService.EXTRA_PORT, payload.udpPort)
             putExtra(H264StreamService.EXTRA_TCP_PORT, payload.tcpPort)
-            putExtra(H264StreamService.EXTRA_WIDTH, 1280)
+            // 4:3 "full sensor" look (most phones are native 4:3) while keeping ~720p height.
+            // 960x720 is 4:3 and encoder-friendly (multiples of 16).
+            putExtra(H264StreamService.EXTRA_WIDTH, 960)
             putExtra(H264StreamService.EXTRA_HEIGHT, 720)
             putExtra(H264StreamService.EXTRA_FPS, 30)
             putExtra(H264StreamService.EXTRA_BITRATE, 2_000_000)

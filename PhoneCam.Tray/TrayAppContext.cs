@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
-using System.Net;
 using System.Net.NetworkInformation;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
@@ -250,25 +249,10 @@ _virtualCamPipeServer.Start();
         {
             _decodeCts?.Cancel();
         }
-
-private void StopVirtualCamPipeServer()
-{
-    var server = _virtualCamPipeServer;
-    _virtualCamPipeServer = null;
-    if (server != null)
-    {
-        try
-        {
-            // Best-effort stop during disposal (avoid blocking UI long)
-            Task.Run(async () => await server.DisposeAsync().ConfigureAwait(false)).Wait(500);
-        }
         catch
         {
-            // ignore
+            /* ignore */
         }
-    }
-}
-        catch { /* ignore */ }
 
         _decodeCts = null;
         _decodeTask = null;
@@ -276,6 +260,25 @@ private void StopVirtualCamPipeServer()
         // окно можно оставить; если хочешь — можно закрывать:
         // _videoForm?.Close();
     }
+
+    private void StopVirtualCamPipeServer()
+    {
+        var server = _virtualCamPipeServer;
+        _virtualCamPipeServer = null;
+        if (server != null)
+        {
+            try
+            {
+                // Best-effort stop during disposal (avoid blocking UI long)
+                Task.Run(async () => await server.DisposeAsync().ConfigureAwait(false)).Wait(500);
+            }
+            catch
+            {
+                // ignore
+            }
+        }
+    }
+
 
     private void Exit()
     {
@@ -492,34 +495,12 @@ private void StopVirtualCamPipeServer()
                 ScanningMode = BluetoothLEScanningMode.Active
             };
 
-            watcher.Received += async (_, args) =>
+            // NOTE: don't name the sender parameter '_' if you use the common fire-and-forget pattern `_ = Task;`
+            // because '_' would then refer to the sender variable (BluetoothLEAdvertisementWatcher), not a discard.
+            watcher.Received += (sender, args) =>
             {
-                try
-                {
-                    if (_connecting) return;
-                    if (DateTime.UtcNow < _nextGlobalAttemptUtc) return;
-
-                    foreach (var uuid in args.Advertisement.ServiceUuids)
-                    {
-                        if (uuid == BleHandshakeService.ServiceUuid)
-                        {
-                            if (!CanAttempt(args.BluetoothAddress)) return;
-
-                            _connecting = true;
-                            StopWatcher();
-                            var success = await HandleDeviceAsync(args.BluetoothAddress, ssid, psk);
-                            _connecting = false;
-                            ScheduleWatcherRestart(success ? _successCooldown : _failureCooldown);
-                            break;
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _connecting = false;
-                    _log("BLE: watcher error " + ex);
-                    ScheduleWatcherRestart(_failureCooldown);
-                }
+                // Don't use 'async void' style handlers here; run async work safely and catch exceptions.
+                _ = HandleAdvertisementReceivedAsync(args, ssid, psk);
             };
 
             _watcher = watcher;
@@ -527,7 +508,63 @@ private void StopVirtualCamPipeServer()
             _log("BLE: scanning for phone advertisements");
         }
 
-        private async Task<bool> HandleDeviceAsync(ulong address, string ssid, string psk)
+        
+
+        private async Task HandleAdvertisementReceivedAsync(BluetoothLEAdvertisementReceivedEventArgs args, string ssid, string psk)
+        {
+            try
+            {
+                // Fast gate: avoid overlapping connection attempts + respect global cooldown
+                lock (_gate)
+                {
+                    if (_connecting) return;
+                    if (DateTime.UtcNow < _nextGlobalAttemptUtc) return;
+                }
+
+                // Check for our service UUID
+                foreach (var uuid in args.Advertisement.ServiceUuids)
+                {
+                    if (uuid != BleHandshakeService.ServiceUuid) continue;
+
+                    // Per-device cooldown
+                    if (!CanAttempt(args.BluetoothAddress)) return;
+
+                    lock (_gate)
+                    {
+                        if (_connecting) return;
+                        _connecting = true;
+                    }
+
+                    StopWatcher();
+
+                    bool success = false;
+                    try
+                    {
+                        success = await HandleDeviceAsync(args.BluetoothAddress, ssid, psk).ConfigureAwait(false);
+                    }
+                    finally
+                    {
+                        lock (_gate)
+                        {
+                            _connecting = false;
+                        }
+                    }
+
+                    ScheduleWatcherRestart(success ? _successCooldown : _failureCooldown);
+                    break;
+                }
+            }
+            catch (Exception ex)
+            {
+                lock (_gate)
+                {
+                    _connecting = false;
+                }
+                _log("BLE: watcher error " + ex);
+                ScheduleWatcherRestart(_failureCooldown);
+            }
+        }
+private async Task<bool> HandleDeviceAsync(ulong address, string ssid, string psk)
         {
             _log($"BLE: phone detected addr={address}");
             _ensureServerRunning();
@@ -745,10 +782,10 @@ private void StopVirtualCamPipeServer()
 
         private static bool IsAppPackaged()
         {
-            const int APPMODEL_ERROR_NO_PACKAGE = 15700;
+            const int appmodelErrorNoPackage = 15700;
             var length = 0;
             var result = GetCurrentPackageFullName(ref length, null);
-            return result != APPMODEL_ERROR_NO_PACKAGE;
+            return result != appmodelErrorNoPackage;
         }
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
