@@ -23,6 +23,8 @@ public sealed class TrayAppContext : ApplicationContext
     private PhoneCamServer? _server;
     private VirtualCamFrameHub? _frameHub;
 
+    private VirtualCamPipeServer? _virtualCamPipeServer;
+
     private readonly NotifyIcon _tray;
     private readonly ToolStripMenuItem _startItem;
     private readonly ToolStripMenuItem _stopItem;
@@ -120,6 +122,11 @@ public sealed class TrayAppContext : ApplicationContext
         _frameHub = new VirtualCamFrameHub(LogSafe);
         _frameHub.Start();
 
+
+// Start VirtualCam IPC server for localhost clients
+// Pipe name is stable; adjust if you need per-user naming.
+_virtualCamPipeServer ??= new VirtualCamPipeServer("PhoneCam.VirtualCam", _frameHub);
+_virtualCamPipeServer.Start();
         _server.Start();
         LogServerDiagnostics();
 
@@ -130,6 +137,8 @@ public sealed class TrayAppContext : ApplicationContext
     {
         Log("Stop clicked");
 
+
+        StopVirtualCamPipeServer();
         StopDecodeLoop();
 
         try
@@ -241,6 +250,24 @@ public sealed class TrayAppContext : ApplicationContext
         {
             _decodeCts?.Cancel();
         }
+
+private void StopVirtualCamPipeServer()
+{
+    var server = _virtualCamPipeServer;
+    _virtualCamPipeServer = null;
+    if (server != null)
+    {
+        try
+        {
+            // Best-effort stop during disposal (avoid blocking UI long)
+            Task.Run(async () => await server.DisposeAsync().ConfigureAwait(false)).Wait(500);
+        }
+        catch
+        {
+            // ignore
+        }
+    }
+}
         catch { /* ignore */ }
 
         _decodeCts = null;
@@ -256,6 +283,7 @@ public sealed class TrayAppContext : ApplicationContext
 
         StopDecodeLoop();
         _ble?.Stop();
+        StopVirtualCamPipeServer();
 
         try
         {
@@ -810,7 +838,11 @@ public sealed class TrayAppContext : ApplicationContext
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing) _tray.Dispose();
+        if (disposing)
+        {
+            StopVirtualCamPipeServer();
+            _tray.Dispose();
+        }
         base.Dispose(disposing);
     }
 
