@@ -20,7 +20,7 @@ namespace PhoneCam.Tray;
 public sealed class TrayAppContext : ApplicationContext
 {
     private PhoneCamServer? _server;
-    private VirtualCamStreamer? _virtualCamStreamer;
+    private VirtualCamSharedMemoryWriter? _virtualCamWriter;
     private bool _virtualCamEnabled;
 
 
@@ -121,8 +121,7 @@ public sealed class TrayAppContext : ApplicationContext
         _server.OnMediaStats += snap =>
             Log($"UDP: {snap.PacketsPerSec:F0} pkt/s, {(snap.BytesPerSec * 8 / 1000.0):F0} kbps, loss={snap.LossPerSec:F1}/s");
 
-        _virtualCamStreamer ??= new VirtualCamStreamer(LogSafe);
-        _virtualCamStreamer.SetEnabled(_virtualCamEnabled);
+        _virtualCamWriter ??= new VirtualCamSharedMemoryWriter();
         _virtualCamItem.Enabled = true;
         UpdateVirtualCamMenuUi();
         _server.Start();
@@ -140,7 +139,6 @@ public sealed class TrayAppContext : ApplicationContext
 
         try
         {
-            _virtualCamStreamer?.SetEnabled(false);
             _virtualCamEnabled = false;
             UpdateVirtualCamMenuUi();
             _virtualCamItem.Enabled = false;
@@ -187,8 +185,7 @@ public sealed class TrayAppContext : ApplicationContext
 
         try
         {
-            _virtualCamStreamer ??= new VirtualCamStreamer(LogSafe);
-            _virtualCamStreamer.SetEnabled(_virtualCamEnabled);
+            _virtualCamWriter ??= new VirtualCamSharedMemoryWriter();
         }
         catch (Exception ex)
         {
@@ -233,7 +230,7 @@ public sealed class TrayAppContext : ApplicationContext
                         {
                             try
                             {
-                                _virtualCamStreamer?.TrySendFrame(bmp);
+                                _virtualCamWriter?.WriteFrame(bmp);
                             }
                             catch (Exception ex)
                             {
@@ -313,12 +310,11 @@ public sealed class TrayAppContext : ApplicationContext
 
         try
         {
-            _virtualCamStreamer?.SetEnabled(false);
             _virtualCamEnabled = false;
             UpdateVirtualCamMenuUi();
             _virtualCamItem.Enabled = false;
-            _virtualCamStreamer?.Dispose();
-            _virtualCamStreamer = null;
+            _virtualCamWriter?.Dispose();
+            _virtualCamWriter = null;
         }
         catch
         {
