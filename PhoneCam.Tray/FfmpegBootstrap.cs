@@ -1,5 +1,7 @@
-﻿using System;
+using System;
+using System.ComponentModel;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using FFmpeg.AutoGen;
 
@@ -7,49 +9,42 @@ namespace PhoneCam.Tray;
 
 internal static class FfmpegBootstrap
 {
-    public static void Init()
+    // Win10+ (на Win11 точно есть)
+    [DllImport("kernel32", SetLastError = true)]
+    private static extern bool SetDefaultDllDirectories(uint directoryFlags);
+
+    [DllImport("kernel32", SetLastError = true)]
+    private static extern IntPtr AddDllDirectory([MarshalAs(UnmanagedType.LPWStr)] string newDirectory);
+
+    private const uint LOAD_LIBRARY_SEARCH_DEFAULT_DIRS = 0x00001000;
+
+    public static void LoadOrThrow()
     {
         var baseDir = AppContext.BaseDirectory;
-        var ffmpegDir = Path.Combine(baseDir, "ffmpeg");
 
-        if (!Directory.Exists(ffmpegDir))
-            throw new DirectoryNotFoundException(
-                $"FFmpeg folder not found: {ffmpegDir}\n" +
-                "Create it and put avcodec/avutil/avformat/swscale dlls inside.");
-
-        // Важно: грузим в правильном порядке зависимостей
-        LoadDll(ffmpegDir, "avutil");
-        LoadDll(ffmpegDir, "swresample"); // если есть
-        LoadDll(ffmpegDir, "swscale");
-        LoadDll(ffmpegDir, "avcodec");
-        LoadDll(ffmpegDir, "avformat");
-        LoadDll(ffmpegDir, "avdevice"); // если есть
-
-        ffmpeg.RootPath = ffmpegDir;
-
-        _ = ffmpeg.av_version_info(); // sanity check
-    }
-
-    private static void LoadDll(string dir, string nameNoExt)
-    {
-        var dllName = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
-            ? $"{nameNoExt}-61.dll"   // частый вариант
-            : $"lib{nameNoExt}.so";
-
-        // Если у тебя другая версия (например avcodec-60.dll), просто переименуй
-        // или добавь ещё один вариант ниже.
-        var path = Path.Combine(dir, dllName);
-
-        if (!File.Exists(path))
+        // где реально могут лежать ffmpeg dll
+        var candidates = new[]
         {
-            // fallback: пытаемся найти любой подходящий avcodec-*.dll
-            var candidates = Directory.GetFiles(dir, $"{nameNoExt}-*.dll");
-            if (candidates.Length > 0) path = candidates[0];
-        }
+            Path.Combine(baseDir, "ffmpeg"),                      // если решите хранить рядом как "ffmpeg\*.dll"
+            Path.Combine(baseDir, "runtimes", "win-x64", "native"),
+            Path.Combine(baseDir, "runtimes", "win7-x64", "native"),
+        };
 
-        if (File.Exists(path))
-        {
-            NativeLibrary.Load(path);
-        }
+        var nativeDir = candidates.FirstOrDefault(Directory.Exists)
+                        ?? throw new DirectoryNotFoundException(
+                            "FFmpeg native folder not found. Expected one of:\n" + string.Join("\n", candidates));
+
+        // Говорим загрузчику DLL: используй стандартные директории + нашу
+        if (!SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+
+        if (AddDllDirectory(nativeDir) == IntPtr.Zero)
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+
+        // Для FFmpeg.AutoGen (динамические биндинги)
+        ffmpeg.RootPath = nativeDir;
+
+        // Триггерим резолв символов сразу, чтобы упасть тут с понятной ошибкой, а не где-то позже
+        _ = ffmpeg.avcodec_version();
     }
 }

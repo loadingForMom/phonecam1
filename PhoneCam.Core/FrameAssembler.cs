@@ -6,7 +6,7 @@ namespace PhoneCam.Core
     {
         private const uint MAGIC = 0x4D414350; // "PCAM" little endian
         private const byte VERSION = 1;
-        private const int MIN_HEADER = 24;
+        private const int MIN_HEADER = 32;
 
         private readonly System.Action<string>? _log;
 
@@ -51,9 +51,9 @@ namespace PhoneCam.Core
             _lastSeq = seq;
 
             var frameId = BinaryPrimitives.ReadUInt32LittleEndian(packet.AsSpan(12, 4));
-            var chunkIndex = BinaryPrimitives.ReadUInt16LittleEndian(packet.AsSpan(16, 2));
-            var chunkCount = BinaryPrimitives.ReadUInt16LittleEndian(packet.AsSpan(18, 2));
-            var payloadLen = (int)BinaryPrimitives.ReadUInt32LittleEndian(packet.AsSpan(20, 4));
+            var chunkIndex = BinaryPrimitives.ReadUInt16LittleEndian(packet.AsSpan(20, 2));
+            var chunkCount = BinaryPrimitives.ReadUInt16LittleEndian(packet.AsSpan(22, 2));
+            var payloadLen = (int)BinaryPrimitives.ReadUInt32LittleEndian(packet.AsSpan(24, 4));
 
             if (chunkCount == 0) return false;
             if (chunkIndex >= chunkCount) return false;

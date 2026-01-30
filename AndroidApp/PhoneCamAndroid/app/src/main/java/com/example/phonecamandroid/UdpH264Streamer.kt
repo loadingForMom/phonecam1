@@ -10,6 +10,9 @@ import android.os.HandlerThread
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import android.os.SystemClock
+import android.view.Surface
+import java.net.NetworkInterface
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.math.ceil
@@ -18,9 +21,13 @@ import kotlin.math.min
 class UdpH264Streamer(
     private val context: Context
 ) {
+    var onLog: ((String) -> Unit)? = null
+    var onStats: ((StreamStats) -> Unit)? = null
+
     // FrameAssembler ожидает magic = "PCAM" в little-endian => 0x4D414350
     private val MAGIC_PCAM = 0x4D414350
-    private val HEADER_SIZE = 24
+    private val VERSION: Byte = 1
+    private val HEADER_SIZE = 32
 
     // Держим датаграммы небольшими (без фрагментации)
     private val MAX_DATAGRAM_SIZE = 1400
@@ -38,6 +45,7 @@ class UdpH264Streamer(
 
     private var encoder: MediaCodec? = null
     private var encoderInputSurface: android.view.Surface? = null
+    private var previewSurface: Surface? = null
 
     private var seq: Int = 0
     private var frameId: Int = 0
@@ -46,16 +54,32 @@ class UdpH264Streamer(
     private var codecConfigAnnexB: ByteArray? = null
     private var sentConfigOnce = false
 
+    private var bytesSince = 0L
+    private var framesSince = 0L
+    private var droppedFrames = 0L
+    private var lastReportMs = SystemClock.elapsedRealtime()
+    private var localIp: String = "-"
+    private var remoteLabel: String = "-"
+
     fun start(host: String, port: Int, width: Int, height: Int, fps: Int, bitrate: Int) {
         remoteAddress = InetAddress.getByName(host)
         remotePort = port
         socket = DatagramSocket()
+        localIp = resolveLocalIp() ?: "-"
+        remoteLabel = "$host:$port"
 
         cameraThread = HandlerThread("PhoneCam-CameraThread").also { it.start() }
         cameraHandler = Handler(cameraThread!!.looper)
 
         setupEncoder(width, height, fps, bitrate)
         openCamera()
+        onStats?.invoke(
+            StreamStats(
+                connectionState = "Streaming",
+                localIp = localIp,
+                remote = remoteLabel
+            )
+        )
     }
 
     fun stop() {
@@ -83,6 +107,10 @@ class UdpH264Streamer(
         sentConfigOnce = false
         seq = 0
         frameId = 0
+        bytesSince = 0
+        framesSince = 0
+        droppedFrames = 0
+        lastReportMs = SystemClock.elapsedRealtime()
     }
 
     private fun setupEncoder(width: Int, height: Int, fps: Int, bitrate: Int) {
@@ -127,11 +155,11 @@ class UdpH264Streamer(
                     val isKeyFrame = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
                     val cfg = codecConfigAnnexB
                     if (cfg != null && (isKeyFrame || !sentConfigOnce)) {
-                        sendFrame(cfg)
+                        sendFrame(cfg, isConfig = true, isKeyFrame = true)
                         sentConfigOnce = true
                     }
 
-                    sendFrame(normalizeToAnnexB(data))
+                    sendFrame(normalizeToAnnexB(data), isConfig = false, isKeyFrame = isKeyFrame)
                 }
 
                 override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {
@@ -147,6 +175,7 @@ class UdpH264Streamer(
                 }
 
                 override fun onError(codec: MediaCodec, e: MediaCodec.CodecException) {
+                    log("Encoder error: ${e.message}")
                     stop()
                 }
             }, cameraHandler)
@@ -207,13 +236,15 @@ class UdpH264Streamer(
         }
     }
 
-    private fun sendFrame(frameBytes: ByteArray) {
+    private fun sendFrame(frameBytes: ByteArray, isConfig: Boolean, isKeyFrame: Boolean) {
         val addr = remoteAddress ?: return
         val port = remotePort
         val sock = socket ?: return
 
         val totalChunks = ceil(frameBytes.size / MAX_PAYLOAD_SIZE.toDouble()).toInt().coerceAtLeast(1)
         val thisFrameId = frameId++
+        val flags = buildFlags(isKeyFrame, isConfig)
+        val timestampMs = (SystemClock.elapsedRealtime() and 0xFFFFFFFFL).toInt()
         var offset = 0
 
         for (chunkIndex in 0 until totalChunks) {
@@ -226,20 +257,29 @@ class UdpH264Streamer(
                 .allocate(HEADER_SIZE + payload.size)
                 .order(ByteOrder.LITTLE_ENDIAN)
                 .apply {
-                    putInt(MAGIC_PCAM)       // 0..3
-                    putLong(0L)              // 4..11 reserved
-                    putInt(seq++)            // 12..15
-                    putInt(thisFrameId)      // 16..19
-                    putShort(chunkIndex.toShort())     // 20..21
-                    putShort(totalChunks.toShort())    // 22..23
+                    putInt(MAGIC_PCAM)                  // 0..3
+                    put(VERSION)                        // 4
+                    put(flags)                          // 5
+                    putShort(HEADER_SIZE.toShort())     // 6..7
+                    putInt(seq++)                       // 8..11
+                    putInt(thisFrameId)                 // 12..15
+                    putInt(timestampMs)                 // 16..19
+                    putShort(chunkIndex.toShort())      // 20..21
+                    putShort(totalChunks.toShort())     // 22..23
+                    putInt(payload.size)                // 24..27
+                    putInt(0)                           // 28..31 streamId=0 (video)
                     put(payload)
                 }
                 .array()
 
             try {
                 sock.send(DatagramPacket(packetBytes, packetBytes.size, addr, port))
+                bytesSince += packetBytes.size
             } catch (_: Throwable) { }
         }
+
+        framesSince++
+        maybeReport()
     }
 
     @android.annotation.SuppressLint("MissingPermission")
@@ -282,11 +322,12 @@ class UdpH264Streamer(
 
         val requestBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
             addTarget(surface)
+            previewSurface?.let { addTarget(it) }
             set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
         }
 
         camera.createCaptureSession(
-            listOf(surface),
+            listOfNotNull(surface, previewSurface),
             object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(session: CameraCaptureSession) {
                     captureSession = session
@@ -303,5 +344,58 @@ class UdpH264Streamer(
             },
             cameraHandler
         )
+    }
+
+    fun setPreviewSurface(surface: Surface?) {
+        previewSurface = surface
+        if (cameraDevice != null) {
+            cameraHandler?.post { createSession() }
+        }
+    }
+
+    private fun buildFlags(isKeyFrame: Boolean, isConfig: Boolean): Byte {
+        var f = 0
+        if (isKeyFrame) f = f or 0x1
+        if (isConfig) f = f or 0x2
+        return f.toByte()
+    }
+
+    private fun maybeReport() {
+        val now = SystemClock.elapsedRealtime()
+        val dt = now - lastReportMs
+        if (dt < 1000) return
+
+        val fps = framesSince * 1000.0 / dt
+        val kbps = (bytesSince * 8.0 / dt)
+        onStats?.invoke(
+            StreamStats(
+                connectionState = "Streaming",
+                fps = fps,
+                bitrateKbps = kbps,
+                droppedFrames = droppedFrames,
+                queueDepth = 0,
+                localIp = localIp,
+                remote = remoteLabel
+            )
+        )
+
+        framesSince = 0
+        bytesSince = 0
+        lastReportMs = now
+    }
+
+    private fun resolveLocalIp(): String? {
+        return try {
+            NetworkInterface.getNetworkInterfaces().toList()
+                .flatMap { it.inetAddresses.toList() }
+                .firstOrNull { !it.isLoopbackAddress && it.hostAddress?.contains(":") == false }
+                ?.hostAddress
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun log(msg: String) {
+        onLog?.invoke(msg)
     }
 }

@@ -10,16 +10,13 @@ internal static class Program
     {
         try
         {
-            FfmpegBootstrap.Init();
+            FfmpegBootstrap.LoadOrThrow();
         }
         catch (Exception ex)
         {
-            MessageBox.Show(
-                "Failed to load FFmpeg native libraries.\n\n" + ex,
-                "PhoneCam",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Error);
+            MessageBox.Show(ex.ToString(), "Failed to load FFmpeg");
             return;
+        
         }
 
         ApplicationConfiguration.Initialize();

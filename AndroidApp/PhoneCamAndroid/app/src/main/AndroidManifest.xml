@@ -17,6 +17,12 @@
     <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"
                      android:usesPermissionFlags="neverForLocation" />
 
+    <!-- BLE permissions for handshake (Android 12+) -->
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+                     android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+
     <application
             android:allowBackup="true"
             android:label="PhoneCam"
@@ -29,6 +35,9 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+        <activity
+                android:name=".LogsActivity"
+                android:exported="false" />
 
         <service
                 android:name=".H264StreamService"
