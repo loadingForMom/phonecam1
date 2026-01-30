@@ -4,7 +4,7 @@ using System.Runtime.InteropServices.ComTypes;
 
 namespace PhoneCam.VirtualCam.Filter.DirectShow
 {
-    internal static class DirectShowRegistration
+    public static class DirectShowRegistration
     {
         // Human-friendly name shown in DirectShow/GraphStudioNext lists
         public const string FilterName = "PhoneCam VirtualCam (Capture Source)";

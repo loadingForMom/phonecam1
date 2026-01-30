@@ -299,8 +299,9 @@ namespace PhoneCam.VirtualCam.Filter.Filter
 
                 // Get frame payload from IPC queue (or generate black frame if none).
                 byte[] frame;
-                bool got = _filter.FrameQueue.TryDequeue(timeoutMs: 5, out frame);
-                if (!got || frame == null || frame.Length != VirtualCamSourceFilter.FrameSize)
+                int frameLen;
+                bool got = _filter.LatestFrame.TryGetReadBuffer(out frame, out frameLen);
+                if (!got || frame == null || frameLen != VirtualCamSourceFilter.FrameSize)
                 {
                     frame = BlackFrameCache.Instance;
                 }
@@ -317,8 +318,9 @@ namespace PhoneCam.VirtualCam.Filter.Filter
                     hr = sample.GetPointer(out var bufPtr);
                     if (HResult.Succeeded(hr) && bufPtr != IntPtr.Zero)
                     {
-                        Marshal.Copy(frame, 0, bufPtr, frame.Length);
-                        sample.SetActualDataLength(frame.Length);
+                        int copyLen = VirtualCamSourceFilter.FrameSize;
+                        Marshal.Copy(frame, 0, bufPtr, copyLen);
+                        sample.SetActualDataLength(copyLen);
 
                         long start = frameIndex * frameDuration;
                         long end = start + frameDuration;

@@ -20,9 +20,9 @@ namespace PhoneCam.Tray;
 public sealed class TrayAppContext : ApplicationContext
 {
     private PhoneCamServer? _server;
-    private VirtualCamFrameHub? _frameHub;
+    private VirtualCamStreamer? _virtualCamStreamer;
+    private bool _virtualCamEnabled;
 
-    private VirtualCamPipeServer? _virtualCamPipeServer;
 
     private readonly NotifyIcon _tray;
     private readonly ToolStripMenuItem _startItem;
@@ -30,6 +30,7 @@ public sealed class TrayAppContext : ApplicationContext
     private readonly ToolStripMenuItem _showVideoItem;
     private readonly ToolStripMenuItem _debugItem;
     private readonly ToolStripMenuItem _bleItem;
+    private readonly ToolStripMenuItem _virtualCamItem;
 
     private bool _running;
 
@@ -62,6 +63,7 @@ public sealed class TrayAppContext : ApplicationContext
         _startItem = new ToolStripMenuItem("Start", null, (_, _) => Start());
         _stopItem = new ToolStripMenuItem("Stop", null, (_, _) => Stop()) { Enabled = false };
         _showVideoItem = new ToolStripMenuItem("Show Video", null, (_, _) => ShowVideo()) { Enabled = false };
+        _virtualCamItem = new ToolStripMenuItem("Virtual Camera: Off", null, (_, _) => ToggleVirtualCam()) { Enabled = false, CheckOnClick = true };
         _debugItem = new ToolStripMenuItem("Debug Console", null, (_, _) => ShowDebugConsole());
         _bleItem = new ToolStripMenuItem("Start BLE Advertise", null, async (_, _) => await ToggleBleAsync());
 
@@ -71,6 +73,7 @@ public sealed class TrayAppContext : ApplicationContext
         menu.Items.Add(_startItem);
         menu.Items.Add(_stopItem);
         menu.Items.Add(_showVideoItem);
+        menu.Items.Add(_virtualCamItem);
         menu.Items.Add(_debugItem);
         menu.Items.Add(_bleItem);
         menu.Items.Add(new ToolStripSeparator());
@@ -118,14 +121,10 @@ public sealed class TrayAppContext : ApplicationContext
         _server.OnMediaStats += snap =>
             Log($"UDP: {snap.PacketsPerSec:F0} pkt/s, {(snap.BytesPerSec * 8 / 1000.0):F0} kbps, loss={snap.LossPerSec:F1}/s");
 
-        _frameHub = new VirtualCamFrameHub(LogSafe);
-        _frameHub.Start();
-
-
-// Start VirtualCam IPC server for localhost clients
-// Pipe name is stable; adjust if you need per-user naming.
-_virtualCamPipeServer ??= new VirtualCamPipeServer("PhoneCam.VirtualCam", _frameHub);
-_virtualCamPipeServer.Start();
+        _virtualCamStreamer ??= new VirtualCamStreamer(LogSafe);
+        _virtualCamStreamer.SetEnabled(_virtualCamEnabled);
+        _virtualCamItem.Enabled = true;
+        UpdateVirtualCamMenuUi();
         _server.Start();
         LogServerDiagnostics();
 
@@ -137,21 +136,18 @@ _virtualCamPipeServer.Start();
         Log("Stop clicked");
 
 
-        StopVirtualCamPipeServer();
         StopDecodeLoop();
 
         try
         {
-            _frameHub?.Stop();
-            _frameHub?.Dispose();
+            _virtualCamStreamer?.SetEnabled(false);
+            _virtualCamEnabled = false;
+            UpdateVirtualCamMenuUi();
+            _virtualCamItem.Enabled = false;
         }
         catch (Exception ex)
         {
-            Log("Frame hub stop failed: " + ex);
-        }
-        finally
-        {
-            _frameHub = null;
+            Log("VirtualCam stop failed: " + ex);
         }
 
         if (_server is not null)
@@ -185,6 +181,31 @@ _virtualCamPipeServer.Start();
         }
     }
 
+    private void ToggleVirtualCam()
+    {
+        _virtualCamEnabled = !_virtualCamEnabled;
+
+        try
+        {
+            _virtualCamStreamer ??= new VirtualCamStreamer(LogSafe);
+            _virtualCamStreamer.SetEnabled(_virtualCamEnabled);
+        }
+        catch (Exception ex)
+        {
+            Log("VirtualCam toggle failed: " + ex.Message);
+            _virtualCamEnabled = false;
+        }
+
+        UpdateVirtualCamMenuUi();
+        Log("VirtualCam: " + (_virtualCamEnabled ? "On" : "Off"));
+    }
+
+    private void UpdateVirtualCamMenuUi()
+    {
+        _virtualCamItem.Checked = _virtualCamEnabled;
+        _virtualCamItem.Text = _virtualCamEnabled ? "Virtual Camera: On" : "Virtual Camera: Off";
+    }
+
     private void StartDecodeLoop()
     {
         if (_server is null) return;
@@ -207,31 +228,53 @@ _virtualCamPipeServer.Start();
                     {
                         fps.OnFrame();
 
-                        // Always publish the frame to the virtual camera hub
-                        try
+                        // Forward the frame to VirtualCam streamer (system-wide webcam) when enabled
+                        if (_virtualCamEnabled)
                         {
-                            _frameHub?.UpdateFromBitmap(bmp);
-                        }
-                        catch (Exception ex)
-                        {
-                            Log("Frame hub update failed: " + ex.Message);
+                            try
+                            {
+                                _virtualCamStreamer?.TrySendFrame(bmp);
+                            }
+                            catch (Exception ex)
+                            {
+                                Log("VirtualCam send failed: " + ex.Message);
+                            }
                         }
 
                         var form = _videoForm;
 
+                        // Preview is optional; do not rely on it for frame production.
                         if (form is not null && !form.IsDisposed)
                         {
-                            // UI thread
-                            form.BeginInvoke(() =>
+                            Bitmap? preview = null;
+                            try
                             {
-                                form.ShowFrame(bmp, fps.CurrentFps);
-                            });
+                                preview = (Bitmap)bmp.Clone();
+                                // IMPORTANT: capture the bitmap by value for the UI callback.
+                                // Otherwise the closure will see preview == null when it runs.
+                                var previewForUi = preview;
+                                form.BeginInvoke(() =>
+                                {
+                                    try
+                                    {
+                                        form.ShowFrame(previewForUi, fps.CurrentFps);
+                                    }
+                                    catch
+                                    {
+                                        // Never crash the decode loop / app due to preview rendering.
+                                        previewForUi?.Dispose();
+                                    }
+                                });
+                                preview = null; // ownership transferred to form/UI callback
+                            }
+                            catch
+                            {
+                                preview?.Dispose();
+                            }
                         }
-                        else
-                        {
-                            // если окна нет — не течём по памяти
-                            bmp.Dispose();
-                        }
+
+                        // Always dispose decoded bitmap (avoid leaks)
+                        bmp.Dispose();
                     }
                 }
             }
@@ -261,45 +304,25 @@ _virtualCamPipeServer.Start();
         // _videoForm?.Close();
     }
 
-    private void StopVirtualCamPipeServer()
-    {
-        var server = _virtualCamPipeServer;
-        _virtualCamPipeServer = null;
-        if (server != null)
-        {
-            try
-            {
-                // Best-effort stop during disposal (avoid blocking UI long)
-                Task.Run(async () => await server.DisposeAsync().ConfigureAwait(false)).Wait(500);
-            }
-            catch
-            {
-                // ignore
-            }
-        }
-    }
-
-
     private void Exit()
     {
         Log("Exit clicked");
 
         StopDecodeLoop();
         _ble?.Stop();
-        StopVirtualCamPipeServer();
 
         try
         {
-            _frameHub?.Stop();
-            _frameHub?.Dispose();
+            _virtualCamStreamer?.SetEnabled(false);
+            _virtualCamEnabled = false;
+            UpdateVirtualCamMenuUi();
+            _virtualCamItem.Enabled = false;
+            _virtualCamStreamer?.Dispose();
+            _virtualCamStreamer = null;
         }
-        catch (Exception ex)
+        catch
         {
-            Log("Frame hub stop failed: " + ex);
-        }
-        finally
-        {
-            _frameHub = null;
+            // ignore
         }
 
         if (_server is not null)
@@ -877,8 +900,7 @@ private async Task<bool> HandleDeviceAsync(ulong address, string ssid, string ps
     {
         if (disposing)
         {
-            StopVirtualCamPipeServer();
-            _tray.Dispose();
+                        _tray.Dispose();
         }
         base.Dispose(disposing);
     }

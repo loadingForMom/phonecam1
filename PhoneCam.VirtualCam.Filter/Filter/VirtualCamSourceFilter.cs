@@ -2,6 +2,7 @@ using System;
 using System.Runtime.InteropServices;
 using PhoneCam.VirtualCam.Filter.DirectShow;
 using PhoneCam.VirtualCam.Filter.Ipc;
+using PhoneCam.VirtualCam.Filter.Util;
 
 namespace PhoneCam.VirtualCam.Filter.Filter
 {
@@ -26,13 +27,13 @@ namespace PhoneCam.VirtualCam.Filter.Filter
         private IFilterGraph _graph;
         private string _name = DirectShowRegistration.FilterName;
 
-        internal readonly FrameQueue FrameQueue = new FrameQueue(maxFrames: 3);
-        internal readonly IpcFrameReceiver Receiver;
+        internal readonly LatestFrameBuffer LatestFrame = new LatestFrameBuffer(FrameSize);
+        internal readonly TcpFrameReceiver Receiver;
 
         public VirtualCamSourceFilter()
         {
             _outputPin = new VirtualCamOutputPin(this);
-            Receiver = new IpcFrameReceiver(FrameQueue, FrameSize);
+            Receiver = new TcpFrameReceiver(LatestFrame, FrameSize, FilterLog.Info);
             Receiver.Start();
         }
 

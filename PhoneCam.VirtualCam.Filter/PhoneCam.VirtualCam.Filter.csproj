@@ -57,7 +57,11 @@
         <Compile Include="Filter\VirtualCamSourceFilter.cs" />
         <Compile Include="Filter\VirtualCamOutputPin.cs" />
         <Compile Include="Ipc\FrameQueue.cs" />
+        <Compile Include="Ipc\FrameProtocol.cs" />
+        <Compile Include="Ipc\LatestFrameBuffer.cs" />
+        <Compile Include="Ipc\TcpFrameReceiver.cs" />
         <Compile Include="Ipc\IpcFrameReceiver.cs" />
+        <Compile Include="Util\FilterLog.cs" />
         <Compile Include="Properties\AssemblyInfo.cs" />
     </ItemGroup>
 
