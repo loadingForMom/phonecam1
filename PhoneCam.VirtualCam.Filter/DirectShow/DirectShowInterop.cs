@@ -303,9 +303,42 @@ namespace PhoneCam.VirtualCam.Filter.DirectShow
 
         public static IntPtr AllocMediaTypePtr(in AMMediaType mt)
         {
+            AMMediaType clone = CloneMediaType(mt);
             IntPtr ptr = Marshal.AllocCoTaskMem(Marshal.SizeOf(typeof(AMMediaType)));
-            Marshal.StructureToPtr(mt, ptr, fDeleteOld: false);
-            return ptr;
+            try
+            {
+                Marshal.StructureToPtr(clone, ptr, fDeleteOld: false);
+                return ptr;
+            }
+            catch
+            {
+                FreeMediaType(ref clone);
+                Marshal.FreeCoTaskMem(ptr);
+                throw;
+            }
+        }
+
+        public static AMMediaType CloneMediaType(in AMMediaType mt)
+        {
+            AMMediaType clone = mt;
+            clone.formatPtr = IntPtr.Zero;
+            clone.formatSize = 0;
+
+            if (mt.formatPtr != IntPtr.Zero && mt.formatSize > 0)
+            {
+                clone.formatPtr = Marshal.AllocCoTaskMem(mt.formatSize);
+                var buffer = new byte[mt.formatSize];
+                Marshal.Copy(mt.formatPtr, buffer, 0, mt.formatSize);
+                Marshal.Copy(buffer, 0, clone.formatPtr, mt.formatSize);
+                clone.formatSize = mt.formatSize;
+            }
+
+            if (clone.unkPtr != IntPtr.Zero)
+            {
+                Marshal.AddRef(clone.unkPtr);
+            }
+
+            return clone;
         }
 
         public static void FreeMediaType(ref AMMediaType mt)
@@ -341,5 +374,16 @@ namespace PhoneCam.VirtualCam.Filter.DirectShow
                 Marshal.FreeCoTaskMem(pmt);
             }
         }
+    }
+
+    internal static class Ole32
+    {
+        public const int COINIT_MULTITHREADED = 0x0;
+
+        [DllImport("ole32.dll")]
+        public static extern int CoInitializeEx(IntPtr pvReserved, int dwCoInit);
+
+        [DllImport("ole32.dll")]
+        public static extern void CoUninitialize();
     }
 }
