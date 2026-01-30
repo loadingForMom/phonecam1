@@ -105,7 +105,6 @@ namespace PhoneCam.VirtualCam.Filter.Filter
                 }
 
                 ppPin = _connectedPin;
-                Marshal.AddRef(Marshal.GetIUnknownForObject(ppPin));
                 return HResult.S_OK;
             }
         }
@@ -134,7 +133,6 @@ namespace PhoneCam.VirtualCam.Filter.Filter
                 dir = PinDirection.Output,
                 achName = PinName
             };
-            Marshal.AddRef(Marshal.GetIUnknownForObject(pInfo.pFilter));
             return HResult.S_OK;
         }
 

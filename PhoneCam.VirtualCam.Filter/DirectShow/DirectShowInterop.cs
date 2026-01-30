@@ -322,6 +322,7 @@ namespace PhoneCam.VirtualCam.Filter.DirectShow
         {
             AMMediaType clone = mt;
             clone.formatPtr = IntPtr.Zero;
+            clone.formatSize = 0;
 
             if (mt.formatPtr != IntPtr.Zero && mt.formatSize > 0)
             {
@@ -329,6 +330,7 @@ namespace PhoneCam.VirtualCam.Filter.DirectShow
                 var buffer = new byte[mt.formatSize];
                 Marshal.Copy(mt.formatPtr, buffer, 0, mt.formatSize);
                 Marshal.Copy(buffer, 0, clone.formatPtr, mt.formatSize);
+                clone.formatSize = mt.formatSize;
             }
 
             if (clone.unkPtr != IntPtr.Zero)
