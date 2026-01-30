@@ -20,7 +20,6 @@ namespace PhoneCam.Tray;
 public sealed class TrayAppContext : ApplicationContext
 {
     private PhoneCamServer? _server;
-    private VirtualCamStreamer? _virtualCamStreamer;
     private bool _virtualCamEnabled;
 
 
@@ -121,8 +120,7 @@ public sealed class TrayAppContext : ApplicationContext
         _server.OnMediaStats += snap =>
             Log($"UDP: {snap.PacketsPerSec:F0} pkt/s, {(snap.BytesPerSec * 8 / 1000.0):F0} kbps, loss={snap.LossPerSec:F1}/s");
 
-        _virtualCamStreamer ??= new VirtualCamStreamer(LogSafe);
-        _virtualCamStreamer.SetEnabled(_virtualCamEnabled);
+        // TODO(MFVirtualCam): wire tray frames into the Media Foundation virtual camera pipeline.
         _virtualCamItem.Enabled = true;
         UpdateVirtualCamMenuUi();
         _server.Start();
@@ -140,7 +138,6 @@ public sealed class TrayAppContext : ApplicationContext
 
         try
         {
-            _virtualCamStreamer?.SetEnabled(false);
             _virtualCamEnabled = false;
             UpdateVirtualCamMenuUi();
             _virtualCamItem.Enabled = false;
@@ -187,8 +184,7 @@ public sealed class TrayAppContext : ApplicationContext
 
         try
         {
-            _virtualCamStreamer ??= new VirtualCamStreamer(LogSafe);
-            _virtualCamStreamer.SetEnabled(_virtualCamEnabled);
+            // TODO(MFVirtualCam): toggle MF virtual camera frame publishing.
         }
         catch (Exception ex)
         {
@@ -233,7 +229,7 @@ public sealed class TrayAppContext : ApplicationContext
                         {
                             try
                             {
-                                _virtualCamStreamer?.TrySendFrame(bmp);
+                                // TODO(MFVirtualCam): send frame to MF virtual camera media source.
                             }
                             catch (Exception ex)
                             {
@@ -313,12 +309,9 @@ public sealed class TrayAppContext : ApplicationContext
 
         try
         {
-            _virtualCamStreamer?.SetEnabled(false);
             _virtualCamEnabled = false;
             UpdateVirtualCamMenuUi();
             _virtualCamItem.Enabled = false;
-            _virtualCamStreamer?.Dispose();
-            _virtualCamStreamer = null;
         }
         catch
         {
