@@ -105,6 +105,7 @@ namespace PhoneCam.VirtualCam.Filter.Filter
                 }
 
                 ppPin = _connectedPin;
+                Marshal.AddRef(Marshal.GetIUnknownForObject(ppPin));
                 return HResult.S_OK;
             }
         }
@@ -119,9 +120,8 @@ namespace PhoneCam.VirtualCam.Filter.Filter
                     return HResult.VFW_E_NOT_CONNECTED;
                 }
 
-                // Return a copy; caller is responsible for freeing the format block in native scenarios.
-                // Here we return a managed struct copy (formatPtr still points to our allocated block).
-                pmt = _mt;
+                // Return a deep clone; caller may free it.
+                pmt = MediaTypeHelper.CloneMediaType(_mt);
                 return HResult.S_OK;
             }
         }
@@ -134,6 +134,7 @@ namespace PhoneCam.VirtualCam.Filter.Filter
                 dir = PinDirection.Output,
                 achName = PinName
             };
+            Marshal.AddRef(Marshal.GetIUnknownForObject(pInfo.pFilter));
             return HResult.S_OK;
         }
 
@@ -276,85 +277,98 @@ namespace PhoneCam.VirtualCam.Filter.Filter
 
         private void StreamThreadMain()
         {
+            int hr = Ole32.CoInitializeEx(IntPtr.Zero, Ole32.COINIT_MULTITHREADED);
+            bool comInitialized = HResult.Succeeded(hr);
+
             // Use a monotonic clock to pace 30 fps, and to generate sample times.
             long frameDuration = MediaTypeHelper.AvgTimePerFrame30Fps; // in 100ns units
             var sw = Stopwatch.StartNew();
             long frameIndex = 0;
 
-            while (!_stop)
+            try
             {
-                IMemInputPin memInput;
-                IMemAllocator allocator;
-                lock (_sync)
+                while (!_stop)
                 {
-                    memInput = _memInput;
-                    allocator = _allocator;
-                }
-
-                if (memInput == null || allocator == null)
-                {
-                    Thread.Sleep(10);
-                    continue;
-                }
-
-                // Get frame payload from IPC queue (or generate black frame if none).
-                byte[] frame;
-                int frameLen;
-                bool got = _filter.LatestFrame.TryGetReadBuffer(out frame, out frameLen);
-                if (!got || frame == null || frameLen != VirtualCamSourceFilter.FrameSize)
-                {
-                    frame = BlackFrameCache.Instance;
-                }
-
-                int hr = allocator.GetBuffer(out var sample, IntPtr.Zero, IntPtr.Zero, 0);
-                if (HResult.Failed(hr) || sample == null)
-                {
-                    Thread.Sleep(1);
-                    continue;
-                }
-
-                try
-                {
-                    hr = sample.GetPointer(out var bufPtr);
-                    if (HResult.Succeeded(hr) && bufPtr != IntPtr.Zero)
+                    IMemInputPin memInput;
+                    IMemAllocator allocator;
+                    lock (_sync)
                     {
-                        int copyLen = VirtualCamSourceFilter.FrameSize;
-                        Marshal.Copy(frame, 0, bufPtr, copyLen);
-                        sample.SetActualDataLength(copyLen);
-
-                        long start = frameIndex * frameDuration;
-                        long end = start + frameDuration;
-                        sample.SetTime(ref start, ref end);
-                        sample.SetSyncPoint(true);
+                        memInput = _memInput;
+                        allocator = _allocator;
                     }
 
-                    memInput.Receive(sample);
-                }
-                catch
-                {
-                    // If downstream fails, stop streaming.
-                    break;
-                }
-                finally
-                {
-                    try { Marshal.ReleaseComObject(sample); } catch { }
-                }
+                    if (memInput == null || allocator == null)
+                    {
+                        Thread.Sleep(10);
+                        continue;
+                    }
 
-                frameIndex++;
+                    // Get frame payload from IPC queue (or generate black frame if none).
+                    byte[] frame;
+                    int frameLen;
+                    bool got = _filter.LatestFrame.TryGetReadBuffer(out frame, out frameLen);
+                    if (!got || frame == null || frameLen != VirtualCamSourceFilter.FrameSize)
+                    {
+                        frame = BlackFrameCache.Instance;
+                    }
 
-                // Pace roughly at 30 fps.
-                long targetTicks100ns = frameIndex * frameDuration;
-                long elapsed100ns = sw.ElapsedTicks * 10_000_000 / Stopwatch.Frequency;
-                long remaining100ns = targetTicks100ns - elapsed100ns;
-                if (remaining100ns > 0)
-                {
-                    int sleepMs = (int)(remaining100ns / 10_000); // 1ms = 10,000 *100ns
-                    if (sleepMs > 0) Thread.Sleep(Math.Min(10, sleepMs));
-                    else Thread.Yield();
+                    hr = allocator.GetBuffer(out var sample, IntPtr.Zero, IntPtr.Zero, 0);
+                    if (HResult.Failed(hr) || sample == null)
+                    {
+                        Thread.Sleep(1);
+                        continue;
+                    }
+
+                    try
+                    {
+                        hr = sample.GetPointer(out var bufPtr);
+                        if (HResult.Succeeded(hr) && bufPtr != IntPtr.Zero)
+                        {
+                            int copyLen = VirtualCamSourceFilter.FrameSize;
+                            Marshal.Copy(frame, 0, bufPtr, copyLen);
+                            sample.SetActualDataLength(copyLen);
+
+                            long start = frameIndex * frameDuration;
+                            long end = start + frameDuration;
+                            sample.SetTime(ref start, ref end);
+                            sample.SetSyncPoint(true);
+                        }
+
+                        memInput.Receive(sample);
+                    }
+                    catch
+                    {
+                        // If downstream fails, stop streaming.
+                        break;
+                    }
+                    finally
+                    {
+                        try { Marshal.ReleaseComObject(sample); } catch { }
+                    }
+
+                    frameIndex++;
+
+                    // Pace roughly at 30 fps.
+                    long targetTicks100ns = frameIndex * frameDuration;
+                    long elapsed100ns = sw.ElapsedTicks * 10_000_000 / Stopwatch.Frequency;
+                    long remaining100ns = targetTicks100ns - elapsed100ns;
+                    if (remaining100ns > 0)
+                    {
+                        int sleepMs = (int)(remaining100ns / 10_000); // 1ms = 10,000 *100ns
+                        if (sleepMs > 0) Thread.Sleep(Math.Min(10, sleepMs));
+                        else Thread.Yield();
+                    }
+                    else
+                    {
+                        Thread.Yield();
+                    }
                 }
-                else
+            }
+            finally
+            {
+                if (comInitialized)
                 {
-                    Thread.Yield();
+                    Ole32.CoUninitialize();
                 }
             }
         }

@@ -86,6 +86,7 @@ namespace PhoneCam.VirtualCam.Filter.Ipc
             Interlocked.Exchange(ref _timestampUtcTicks, timestampUtcTicks);
 
             Volatile.Write(ref _activeIndex, writeIndex);
+            Volatile.Write(ref _hasFrame, true);
         }
 
         public (int Width, int Height, int StrideBytes, ushort PixelFormat, long TimestampUtcTicks) GetLastMeta()
