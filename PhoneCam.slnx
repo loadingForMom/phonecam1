@@ -1,4 +1,10 @@
 <Solution>
   <Project Path="PhoneCam.Core/PhoneCam.Core.csproj" />
   <Project Path="PhoneCam.Tray/PhoneCam.Tray.csproj" />
+  <Project Path="PhoneCam.VirtualCam.Filter/PhoneCam.VirtualCam.Filter.csproj">
+    <Platform Solution="Debug|*" Project="x64" />
+  </Project>
+  <Project Path="PhoneCam.VirtualCam.RegisterTool/PhoneCam.VirtualCam.RegisterTool.csproj">
+    <Platform Solution="Debug|*" Project="x64" />
+  </Project>
 </Solution>

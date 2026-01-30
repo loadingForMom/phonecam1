@@ -17,8 +17,16 @@ public sealed class VideoForm : Form
         Controls.Add(_lbl);
     }
 
-    public void ShowFrame(Bitmap bmp, double fps)
+    public void ShowFrame(Bitmap? bmp, double fps)
     {
+        if (bmp is null) return;
+        if (IsDisposed || Disposing)
+        {
+            // If a frame arrives while the form is closing, just drop it.
+            bmp.Dispose();
+            return;
+        }
+
         LastFps = fps;
         _lbl.Text = $"FPS: {fps:F1}   {bmp.Width}x{bmp.Height}";
 

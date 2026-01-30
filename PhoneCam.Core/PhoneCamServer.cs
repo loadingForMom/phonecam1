@@ -75,21 +75,50 @@ public sealed class PhoneCamServer : IAsyncDisposable
         _cts.Dispose();
     }
 
-    private void Log(string s) => OnLog?.Invoke(s);
+    private void Log(string s)
+    {
+        try
+        {
+            OnLog?.Invoke(s);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine("OnLog failed: " + ex);
+        }
+    }
 
     // ---------- TCP CONTROL ----------
     private async Task RunTcpControlAsync(CancellationToken ct)
     {
         var listener = new TcpListener(IPAddress.Any, ControlPort);
-        listener.Start();
-        Log($"TCP control listening on 0.0.0.0:{ControlPort}");
+        try
+        {
+            listener.Start();
+            Log($"TCP control listening on 0.0.0.0:{ControlPort}");
+        }
+        catch (Exception ex)
+        {
+            Log($"TCP listener failed: {ex}");
+            return;
+        }
 
         try
         {
             while (!ct.IsCancellationRequested)
             {
-                var client = await listener.AcceptTcpClientAsync(ct);
-                _ = Task.Run(() => HandleClientAsync(client, ct), ct);
+                try
+                {
+                    var client = await listener.AcceptTcpClientAsync(ct);
+                    _ = Task.Run(() => HandleClientAsync(client, ct), ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    Log("TCP accept failed: " + ex);
+                }
             }
         }
         finally
@@ -179,10 +208,19 @@ public sealed class PhoneCamServer : IAsyncDisposable
 
     private async Task RunUdpMediaAsync(CancellationToken ct)
     {
-        using var udp = new UdpClient(new IPEndPoint(IPAddress.Any, UdpPort));
-        udp.Client.ReceiveBufferSize = 4 * 1024 * 1024;
-
-        Log($"UDP media listening on 0.0.0.0:{UdpPort}");
+        UdpClient? udp = null;
+        try
+        {
+            udp = new UdpClient(new IPEndPoint(IPAddress.Any, UdpPort));
+            udp.Client.ReceiveBufferSize = 4 * 1024 * 1024;
+            Log($"UDP media listening on 0.0.0.0:{UdpPort}");
+        }
+        catch (Exception ex)
+        {
+            Log("UDP listener failed: " + ex);
+            udp?.Dispose();
+            return;
+        }
 
         var assembler = new FrameAssembler(Log);
 
@@ -196,6 +234,11 @@ public sealed class PhoneCamServer : IAsyncDisposable
             catch (OperationCanceledException)
             {
                 break;
+            }
+            catch (Exception ex)
+            {
+                Log("UDP receive failed: " + ex);
+                continue;
             }
 
             _stats.OnPacket(res.Buffer.Length);
@@ -212,6 +255,8 @@ public sealed class PhoneCamServer : IAsyncDisposable
                 _frames.Writer.TryWrite(accessUnit);
             }
         }
+
+        udp.Dispose();
     }
 
     private async Task RunStatsLoopAsync(CancellationToken ct)

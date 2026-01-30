@@ -11,6 +11,7 @@ import android.net.LinkAddress
 import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Binder
 import android.os.IBinder
@@ -19,6 +20,8 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import java.net.Inet4Address
 import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
 import kotlin.concurrent.thread
 import kotlin.math.max
 
@@ -58,14 +61,17 @@ class H264StreamService : Service() {
 
         val host = intent.getStringExtra(EXTRA_HOST) ?: "192.168.137.1"
         val port = intent.getIntExtra(EXTRA_PORT, 39010) // UDP port (display)
-        val width = intent.getIntExtra(EXTRA_WIDTH, 1280)
+        // Default to 4:3 with ~720p height ("full sensor" on most phones).
+        // 960x720 keeps bandwidth manageable and plays nicely with H.264 encoders.
+        val width = intent.getIntExtra(EXTRA_WIDTH, 960)
         val height = intent.getIntExtra(EXTRA_HEIGHT, 720)
         val fps = intent.getIntExtra(EXTRA_FPS, 30)
         val bitrate = intent.getIntExtra(EXTRA_BITRATE, 2_000_000)
+        val controlPort = intent.getIntExtra(EXTRA_TCP_PORT, 39000)
 
         stopStreamerIfAny()
 
-        StreamState.updateStats(StreamStats(connectionState = "Starting", remote = "$host:$port"))
+        StreamState.update(StreamStats(connectionState = "Starting", remote = "$host:$port"))
 
         acquireWakeLock()
         runSuCheck()
@@ -74,7 +80,7 @@ class H264StreamService : Service() {
             try {
                 // 1) Force routing via the correct Wi-Fi network (hotspot), otherwise Android may pick mobile data
                 notifyStatus("Binding network…")
-                val pinned = ensureBoundToBestWifiNetworkForHost(host, timeoutMs = 10_000)
+                val pinned = ensureBoundToBestWifiNetworkForHost(host, controlPort, timeoutMs = 10_000)
                 if (!pinned) {
                     failAndStop("Failed: no Wi-Fi route to $host", host, port)
                     return@thread
@@ -84,7 +90,7 @@ class H264StreamService : Service() {
                 notifyStatus("Connecting…")
                 val negotiated = negotiateWithRetries(
                     host = host,
-                    controlPort = 39000,
+                    controlPort = controlPort,
                     width = width,
                     height = height,
                     fps = fps,
@@ -104,7 +110,7 @@ class H264StreamService : Service() {
                     st.setPreviewSurface(previewSurface)
                     st.onLog = { StreamState.log(it) }
                     st.onStats = { stats ->
-                        StreamState.updateStats(stats)
+                        StreamState.update(stats)
 
                         val bad =
                             stats.connectionState.startsWith("Failed", ignoreCase = true) ||
@@ -150,7 +156,7 @@ class H264StreamService : Service() {
 
         for (i in 1..attempts) {
             // Re-pin network each attempt (covers cases when OS rebinds due to Wi-Fi switching)
-            ensureBoundToBestWifiNetworkForHost(host, timeoutMs = 2_500)
+            ensureBoundToBestWifiNetworkForHost(host, controlPort, timeoutMs = 2_500)
 
             try {
                 StreamState.log("Control connect attempt $i/$attempts → $host:$controlPort")
@@ -180,7 +186,7 @@ class H264StreamService : Service() {
     }
 
     private fun failAndStop(msg: String, host: String, port: Int) {
-        StreamState.updateStats(StreamStats(connectionState = msg, remote = "$host:$port"))
+        StreamState.update(StreamStats(connectionState = msg, remote = "$host:$port"))
         stopStreamerIfAny()
         releaseWakeLock()
         unbindProcessNetwork()
@@ -191,7 +197,7 @@ class H264StreamService : Service() {
 
     private fun stopStreaming(state: String) {
         stopStreamerIfAny()
-        StreamState.updateStats(StreamStats(connectionState = state))
+        StreamState.update(StreamStats(connectionState = state))
         releaseWakeLock()
         unbindProcessNetwork()
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -296,14 +302,28 @@ class H264StreamService : Service() {
      * Ensure traffic goes via the Wi-Fi network that actually has a route to [host].
      * This prevents Android from trying to connect via mobile data / other Wi-Fi and producing ENETUNREACH.
      */
-    private fun ensureBoundToBestWifiNetworkForHost(host: String, timeoutMs: Long): Boolean {
+    private fun ensureBoundToBestWifiNetworkForHost(host: String, controlPort: Int, timeoutMs: Long): Boolean {
         val cm = getSystemService(ConnectivityManager::class.java) ?: return false
         val deadline = System.currentTimeMillis() + max(0L, timeoutMs)
 
         val hostAddr: InetAddress? = try { InetAddress.getByName(host) } catch (_: Throwable) { null }
+        logWifiDiagnostics(cm, hostAddr, host, controlPort)
+
+        val immediate = findWifiNetworkForHost(cm, hostAddr, host, controlPort)
+        if (immediate != null) {
+            if (boundNetwork != immediate) {
+                if (bindProcessNetwork(cm, immediate)) {
+                    boundNetwork = immediate
+                    StreamState.log("Network bound to Wi-Fi: $immediate")
+                } else {
+                    StreamState.log("Failed to bind process to Wi-Fi network")
+                }
+            }
+            return true
+        }
 
         while (System.currentTimeMillis() <= deadline) {
-            val wifi = findWifiNetworkForHost(cm, hostAddr)
+            val wifi = findWifiNetworkForHost(cm, hostAddr, host, controlPort)
             if (wifi != null) {
                 if (boundNetwork != wifi) {
                     if (bindProcessNetwork(cm, wifi)) {
@@ -325,7 +345,13 @@ class H264StreamService : Service() {
         return false
     }
 
-    private fun findWifiNetworkForHost(cm: ConnectivityManager, hostAddr: InetAddress?): Network? {
+    @Suppress("DEPRECATION")
+    private fun findWifiNetworkForHost(
+        cm: ConnectivityManager,
+        hostAddr: InetAddress?,
+        host: String,
+        port: Int
+    ): Network? {
         val nets = try { cm.allNetworks } catch (_: Throwable) { emptyArray<Network>() }
         if (nets.isEmpty()) return null
 
@@ -334,7 +360,7 @@ class H264StreamService : Service() {
             val caps = cm.getNetworkCapabilities(n) ?: return@firstOrNull false
             if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return@firstOrNull false
             val lp = cm.getLinkProperties(n) ?: return@firstOrNull false
-            isHostOnSameSubnet(hostAddr, lp)
+            hasIpv4(lp) && (isHostOnSameSubnet(hostAddr, lp) || hasRouteToHost(hostAddr, lp))
         }
         if (preferred != null) return preferred
 
@@ -344,7 +370,14 @@ class H264StreamService : Service() {
             caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
                     caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_SUSPENDED)
         }
-        if (anyWifi != null) return anyWifi
+        if (anyWifi != null) {
+            val lp = cm.getLinkProperties(anyWifi)
+            if (lp != null && hasIpv4(lp)) {
+                val probe = quickProbe(anyWifi, host, port)
+                StreamState.log("Probe hint: $host:$port result=$probe")
+                return anyWifi
+            }
+        }
 
         // Last resort: active network if it is Wi-Fi
         val active = cm.activeNetwork ?: return null
@@ -368,6 +401,71 @@ class H264StreamService : Service() {
         return false
     }
 
+    private fun hasIpv4(lp: LinkProperties): Boolean {
+        return lp.linkAddresses.any { it.address is Inet4Address }
+    }
+
+    private fun hasRouteToHost(hostAddr: InetAddress?, lp: LinkProperties): Boolean {
+        if (hostAddr == null) return false
+        return lp.routes.any { route ->
+            route.destination?.contains(hostAddr) == true
+        }
+    }
+
+    private enum class ProbeResult { Success, Refused, Timeout, Error }
+
+    private fun quickProbe(network: Network, host: String, port: Int): ProbeResult {
+        return try {
+            val socket = network.socketFactory.createSocket()
+            socket.use { it.connect(InetSocketAddress(host, port), 1500) }
+            StreamState.log("Probe: $host:$port success via $network")
+            ProbeResult.Success
+        } catch (e: java.net.ConnectException) {
+            StreamState.log("Probe: $host:$port refused via $network")
+            ProbeResult.Refused
+        } catch (e: java.net.SocketTimeoutException) {
+            StreamState.log("Probe: $host:$port timeout via $network")
+            ProbeResult.Timeout
+        } catch (e: Throwable) {
+            StreamState.log("Probe: $host:$port error ${e.message}")
+            ProbeResult.Error
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun logWifiDiagnostics(cm: ConnectivityManager, hostAddr: InetAddress?, host: String, controlPort: Int) {
+        try {
+            val active = cm.activeNetwork
+            val caps = active?.let { cm.getNetworkCapabilities(it) }
+            val lp = active?.let { cm.getLinkProperties(it) }
+            val transport = when {
+                caps == null -> "none"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "WIFI"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "CELLULAR"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ETHERNET"
+                else -> "OTHER"
+            }
+
+            val wifiManager = applicationContext.getSystemService(WifiManager::class.java)
+            val ssid = try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    "-" // Deprecated and requires location permission
+                } else {
+                    wifiManager?.connectionInfo?.ssid ?: "-"
+                }
+            } catch (_: Throwable) { "-" }
+
+            val localIp = lp?.linkAddresses?.firstOrNull { it.address is Inet4Address }?.address?.hostAddress ?: "-"
+            val onSubnet = lp?.let { isHostOnSameSubnet(hostAddr as? Inet4Address, it) } == true
+            StreamState.log("Wi-Fi diag: active=$transport ssid=$ssid localIp=$localIp host=$host sameSubnet=$onSubnet")
+            if (active != null && caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true) {
+                quickProbe(active, host, controlPort)
+            }
+        } catch (t: Throwable) {
+            StreamState.log("Wi-Fi diag failed: ${t.message}")
+        }
+    }
+
     private fun ipv4ToInt(a: Inet4Address): Int {
         val b = a.address
         return ((b[0].toInt() and 0xFF) shl 24) or
@@ -380,26 +478,30 @@ class H264StreamService : Service() {
         return if (prefix == 0) 0 else (-1 shl (32 - prefix))
     }
 
+    @Suppress("DEPRECATION")
     private fun bindProcessNetwork(cm: ConnectivityManager, network: Network): Boolean {
         return try {
-            when {
-                Build.VERSION.SDK_INT >= 23 -> cm.bindProcessToNetwork(network)
-                Build.VERSION.SDK_INT >= 21 -> ConnectivityManager.setProcessDefaultNetwork(network)
-                else -> true
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                cm.bindProcessToNetwork(network)
+            } else {
+                ConnectivityManager.setProcessDefaultNetwork(network)
             }
+            true
         } catch (t: Throwable) {
             StreamState.log("bindProcessNetwork failed: ${t.message}")
             false
         }
     }
 
+    @Suppress("DEPRECATION")
     private fun unbindProcessNetwork() {
         val cm = try { getSystemService(ConnectivityManager::class.java) } catch (_: Throwable) { null }
         try {
             if (cm != null) {
-                when {
-                    Build.VERSION.SDK_INT >= 23 -> cm.bindProcessToNetwork(null)
-                    Build.VERSION.SDK_INT >= 21 -> ConnectivityManager.setProcessDefaultNetwork(null)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    cm.bindProcessToNetwork(null)
+                } else {
+                    ConnectivityManager.setProcessDefaultNetwork(null)
                 }
             }
         } catch (_: Throwable) {
@@ -413,6 +515,7 @@ class H264StreamService : Service() {
 
         const val EXTRA_HOST = "host"
         const val EXTRA_PORT = "port"
+        const val EXTRA_TCP_PORT = "tcpPort"
         const val EXTRA_WIDTH = "w"
         const val EXTRA_HEIGHT = "h"
         const val EXTRA_FPS = "fps"
