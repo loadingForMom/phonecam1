@@ -43,7 +43,7 @@
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>mfplat.lib;mf.lib;mfuuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>mfplat.lib;mf.lib;mfuuid.lib;shell32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -54,18 +54,22 @@
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>mfplat.lib;mf.lib;mfuuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>mfplat.lib;mf.lib;mfuuid.lib;shell32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
 
   <ItemGroup>
     <ClCompile Include="ClassFactory.cpp" />
+    <ClCompile Include="Logger.cpp" />
+    <ClCompile Include="SharedFrameReader.cpp" />
     <ClCompile Include="VirtualCamMediaSource.cpp" />
     <ClCompile Include="VirtualCamMediaStream.cpp" />
     <ClCompile Include="dllmain.cpp" />
   </ItemGroup>
 
   <ItemGroup>
+    <ClInclude Include="Logger.h" />
+    <ClInclude Include="SharedFrameReader.h" />
     <ClInclude Include="VirtualCamGuids.h" />
     <ClInclude Include="VirtualCamMediaSource.h" />
     <ClInclude Include="VirtualCamMediaStream.h" />

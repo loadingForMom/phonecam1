@@ -7,4 +7,5 @@
   <Project Path="PhoneCam.VirtualCam.MF.Driver/PhoneCam.VirtualCam.MF.Driver.vcxproj">
     <Platform Solution="Debug|*" Project="x64" />
   </Project>
+  <Project Path="PhoneCam.VirtualCam.MF.Tester/PhoneCam.VirtualCam.MF.Tester.csproj" />
 </Solution>

@@ -1,4 +1,5 @@
 #include "VirtualCamGuids.h"
+#include "Logger.h"
 
 #include <windows.h>
 #include <strsafe.h>
@@ -72,6 +73,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 
 STDAPI DllGetClassObject(REFCLSID rclsid, REFIID riid, void** ppv)
 {
+    LogInfo(L"MF source DllGetClassObject called.");
     return CreateClassFactory(rclsid, riid, ppv);
 }
 
@@ -82,11 +84,13 @@ STDAPI DllCanUnloadNow()
 
 STDAPI DllRegisterServer()
 {
+    LogInfo(L"MF source registration requested.");
     return RegisterServer(true);
 }
 
 STDAPI DllUnregisterServer()
 {
+    LogInfo(L"MF source unregistration requested.");
     return RegisterServer(false);
 }
 

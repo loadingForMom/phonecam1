@@ -1,8 +1,12 @@
 #include "VirtualCamMediaStream.h"
+#include "SharedFrameReader.h"
+#include "Logger.h"
 
 #include <mfapi.h>
 #include <mferror.h>
 #include <propvarutil.h>
+#include <windows.h>
+#include <cstring>
 
 namespace
 {
@@ -27,6 +31,7 @@ VirtualCamMediaStream::VirtualCamMediaStream(DWORD streamId, IMFStreamDescriptor
 
     MFCreateEventQueue(&m_eventQueue);
     m_frameDuration = kHundredNsPerSec / 30;
+    m_reader = std::make_unique<SharedFrameReader>();
 }
 
 VirtualCamMediaStream::~VirtualCamMediaStream()
@@ -43,6 +48,7 @@ HRESULT VirtualCamMediaStream::Start()
 
     m_started = true;
     m_frameIndex = 0;
+    LogInfo(L"MF stream started.");
     return QueueEvent(MEStreamStarted, GUID_NULL, S_OK, nullptr);
 }
 
@@ -53,6 +59,7 @@ HRESULT VirtualCamMediaStream::Stop()
         return MF_E_SHUTDOWN;
 
     m_started = false;
+    LogInfo(L"MF stream stopped.");
     return QueueEvent(MEStreamStopped, GUID_NULL, S_OK, nullptr);
 }
 
@@ -63,6 +70,7 @@ HRESULT VirtualCamMediaStream::Shutdown()
         return S_OK;
 
     m_shutdown = true;
+    m_reader.reset();
     if (m_eventQueue)
     {
         m_eventQueue->Shutdown();
@@ -194,7 +202,10 @@ STDMETHODIMP VirtualCamMediaStream::RequestSample(IUnknown* pToken)
     IMFSample* sample = nullptr;
     HRESULT hr = CreateSample(&sample);
     if (FAILED(hr))
+    {
+        LogHr(L"MF stream: CreateSample failed.", hr);
         return hr;
+    }
 
     if (pToken)
     {
@@ -271,23 +282,34 @@ HRESULT VirtualCamMediaStream::FillSampleBuffer(IMFMediaBuffer* buffer)
     if (FAILED(hr))
         return hr;
 
-    const BYTE r = 0x20;
-    const BYTE g = 0x80;
-    const BYTE b = 0xE0;
-    const BYTE a = 0xFF;
-
-    for (UINT32 y = 0; y < m_height; ++y)
+    bool hadFrame = false;
+    bool copied = false;
+    if (m_reader)
     {
-        BYTE* row = data + (y * m_stride);
-        for (UINT32 x = 0; x < m_width; ++x)
+        HANDLE evt = m_reader->GetEventHandle();
+        if (evt)
         {
-            row[x * 4 + 0] = b;
-            row[x * 4 + 1] = g;
-            row[x * 4 + 2] = r;
-            row[x * 4 + 3] = a;
+            WaitForSingleObject(evt, 15);
         }
+        copied = m_reader->TryCopyLatestFrame(data, maxLength, hadFrame);
+    }
+    if (!copied)
+    {
+        LogInfo(L"MF stream: failed to copy shared frame, using black frame.");
+        FillBlack(data, maxLength);
+    }
+    else if (!hadFrame)
+    {
+        FillBlack(data, maxLength);
     }
 
     buffer->Unlock();
     return S_OK;
+}
+
+void VirtualCamMediaStream::FillBlack(BYTE* data, DWORD length)
+{
+    if (!data || length == 0)
+        return;
+    std::memset(data, 0, length);
 }

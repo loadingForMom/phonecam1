@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <mfidl.h>
 
@@ -34,6 +35,7 @@ private:
 
     HRESULT CreateSample(IMFSample** sample);
     HRESULT FillSampleBuffer(IMFMediaBuffer* buffer);
+    void FillBlack(BYTE* data, DWORD length);
 
     std::atomic<ULONG> m_refCount{1};
     std::mutex m_mutex;
@@ -49,4 +51,5 @@ private:
     UINT32 m_width = 1280;
     UINT32 m_height = 720;
     UINT32 m_stride = 1280 * 4;
+    std::unique_ptr<class SharedFrameReader> m_reader;
 };

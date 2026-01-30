@@ -20,6 +20,7 @@ namespace PhoneCam.Tray;
 public sealed class TrayAppContext : ApplicationContext
 {
     private PhoneCamServer? _server;
+    private VirtualCamSharedMemoryWriter? _virtualCamWriter;
     private bool _virtualCamEnabled;
 
 
@@ -120,7 +121,7 @@ public sealed class TrayAppContext : ApplicationContext
         _server.OnMediaStats += snap =>
             Log($"UDP: {snap.PacketsPerSec:F0} pkt/s, {(snap.BytesPerSec * 8 / 1000.0):F0} kbps, loss={snap.LossPerSec:F1}/s");
 
-        // TODO(MFVirtualCam): wire tray frames into the Media Foundation virtual camera pipeline.
+        _virtualCamWriter ??= new VirtualCamSharedMemoryWriter();
         _virtualCamItem.Enabled = true;
         UpdateVirtualCamMenuUi();
         _server.Start();
@@ -184,7 +185,7 @@ public sealed class TrayAppContext : ApplicationContext
 
         try
         {
-            // TODO(MFVirtualCam): toggle MF virtual camera frame publishing.
+            _virtualCamWriter ??= new VirtualCamSharedMemoryWriter();
         }
         catch (Exception ex)
         {
@@ -229,7 +230,7 @@ public sealed class TrayAppContext : ApplicationContext
                         {
                             try
                             {
-                                // TODO(MFVirtualCam): send frame to MF virtual camera media source.
+                                _virtualCamWriter?.WriteFrame(bmp);
                             }
                             catch (Exception ex)
                             {
@@ -312,6 +313,8 @@ public sealed class TrayAppContext : ApplicationContext
             _virtualCamEnabled = false;
             UpdateVirtualCamMenuUi();
             _virtualCamItem.Enabled = false;
+            _virtualCamWriter?.Dispose();
+            _virtualCamWriter = null;
         }
         catch
         {

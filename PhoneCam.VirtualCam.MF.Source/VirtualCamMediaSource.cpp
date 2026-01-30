@@ -1,4 +1,5 @@
 #include "VirtualCamMediaSource.h"
+#include "Logger.h"
 
 #include <mfapi.h>
 #include <mferror.h>
@@ -21,11 +22,13 @@ VirtualCamMediaSource::VirtualCamMediaSource()
 {
     DllAddRef();
     Initialize();
+    LogInfo(L"MF media source created.");
 }
 
 VirtualCamMediaSource::~VirtualCamMediaSource()
 {
     Shutdown();
+    LogInfo(L"MF media source destroyed.");
     DllRelease();
 }
 
@@ -70,6 +73,7 @@ HRESULT VirtualCamMediaSource::Initialize()
         return hr;
 
     m_stream = new VirtualCamMediaStream(kStreamId, m_streamDescriptor, this);
+    LogInfo(L"MF media source initialized.");
     return S_OK;
 }
 
@@ -204,6 +208,7 @@ STDMETHODIMP VirtualCamMediaSource::Start(IMFPresentationDescriptor* pPresentati
         m_stream->Start();
     }
 
+    LogInfo(L"MF media source started.");
     return QueueEvent(MESourceStarted, GUID_NULL, S_OK, nullptr);
 }
 
@@ -218,6 +223,7 @@ STDMETHODIMP VirtualCamMediaSource::Stop()
         m_stream->Stop();
     }
 
+    LogInfo(L"MF media source stopped.");
     return QueueEvent(MESourceStopped, GUID_NULL, S_OK, nullptr);
 }
 
@@ -261,6 +267,7 @@ STDMETHODIMP VirtualCamMediaSource::Shutdown()
         m_eventQueue = nullptr;
     }
 
+    LogInfo(L"MF media source shutdown.");
     return S_OK;
 }
 

@@ -10,6 +10,7 @@ This repository now uses a Media Foundation (MF) virtual camera backed by an in-
 ## Projects
 - **PhoneCam.VirtualCam.MF.Source** (C++ DLL): Media Foundation media source that outputs fixed 1280x720@30 RGB32 frames.
 - **PhoneCam.VirtualCam.MF.Driver** (C++ console): Registers/unregisters the MF virtual camera using `MFCreateVirtualCamera`.
+- **PhoneCam.VirtualCam.MF.Tester** (.NET console): Writes a moving color pattern into the shared memory frame buffer for validation.
 
 ## Build
 1. Open `PhoneCam.slnx` in Visual Studio 2022.
@@ -43,9 +44,10 @@ This will:
 - Verify **Windows Camera** app lists "PhoneCam Virtual Camera".
 - Verify **Telegram** camera settings list it.
 - Verify **Chrome/Edge** `getUserMedia` camera selector lists it.
+- For frame continuity testing, run `PhoneCam.VirtualCam.MF.Tester.exe` to publish a moving pattern into shared memory and verify the preview updates continuously.
 
 If you see "Access denied" when starting the virtual camera, ensure you registered the COM DLL from a location accessible to the Windows Frame Server services (avoid user-profile-only directories).
 
 ## Notes
-- The media source currently produces solid-color RGB32 frames as a stable baseline.
-- The frame delivery path from the tray app is marked with `TODO(MFVirtualCam)` and will be wired in the next step.
+- The media source reads the latest frame from shared memory and falls back to black frames if none are available.
+- Use the tester utility to validate continuity without running the tray app.
